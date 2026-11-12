@@ -2,10 +2,13 @@
 //! commit a snapshot was taken at, the states it refuses to import, and the
 //! detached HEAD it leaves in the imported copy.
 
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+use rustix::fs::{FileType, Mode, OFlags};
+
+use super::at;
 use crate::error::{Error, Next, Reason};
 
 /// Refuse to import a directory whose Git state a copy would get wrong: a linked
@@ -109,16 +112,59 @@ pub(crate) fn head(read: impl Fn(&Path) -> Option<String>) -> Option<String> {
     })
 }
 
-/// Point the copy's HEAD at `commit` directly, so work in a worktree never moves
-/// a branch the source has checked out. Leaves a HEAD that's already detached.
-pub(crate) fn detach(tree: &Path, commit: &str) -> io::Result<()> {
-    let head = tree.join(".git/HEAD");
-    match fs::read_to_string(&head) {
-        Ok(text) if text.starts_with("ref: ") => fs::write(&head, format!("{commit}\n")),
-        Ok(_) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err),
+/// A reader for [`head`] that reads regular files beneath the open directory
+/// `tree` and nothing else: no symlinks, and no paths that leave it.
+pub(crate) fn reader(tree: &File) -> impl Fn(&Path) -> Option<String> + '_ {
+    |relative| read_beneath(tree, relative).ok()
+}
+
+fn read_beneath(tree: &File, relative: &Path) -> io::Result<String> {
+    let fd = at::beneath(
+        tree,
+        relative,
+        OFlags::RDONLY | OFlags::NOCTTY | OFlags::NONBLOCK,
+        Mode::empty(),
+    )?;
+    if at::fstat(&fd)?.kind != FileType::RegularFile {
+        return Err(io::ErrorKind::InvalidInput.into());
     }
+    let mut text = String::new();
+    File::from(fd).read_to_string(&mut text)?;
+    Ok(text)
+}
+
+/// Point the copy's HEAD at `commit` directly, so work in a worktree never moves
+/// a branch the source has checked out. `tree` is the copy, open. Leaves a HEAD
+/// that's already detached, or that isn't a regular file. The new HEAD replaces the
+/// old one with a rename, so nothing is written through a link.
+pub(crate) fn detach(tree: &File, commit: &str) -> io::Result<()> {
+    let git = match at::open_dir_beneath(tree, Path::new(".git")) {
+        Ok(git) => git,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    let git = File::from(git);
+    match read_beneath(&git, Path::new("HEAD")) {
+        Ok(text) if text.starts_with("ref: ") => {}
+        _ => return Ok(()),
+    }
+    let temporary = format!("HEAD.beavy-{}", super::random_id());
+    let write = || -> io::Result<()> {
+        let mut file = File::from(rustix::fs::openat(
+            &git,
+            temporary.as_str(),
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o644),
+        )?);
+        file.write_all(format!("{commit}\n").as_bytes())?;
+        rustix::fs::renameat(&git, temporary.as_str(), &git, "HEAD")?;
+        Ok(())
+    };
+    let result = write();
+    if result.is_err() {
+        let _ = rustix::fs::unlinkat(&git, temporary.as_str(), rustix::fs::AtFlags::empty());
+    }
+    result
 }
 
 fn is_hash(text: &str) -> bool {
@@ -207,13 +253,34 @@ mod tests {
     #[test]
     fn detach_rewrites_only_a_symbolic_head() {
         let dir = tempfile::tempdir().unwrap();
-        detach(dir.path(), HASH).unwrap();
+        let tree = File::from(at::open_dir(dir.path()).unwrap());
+        detach(&tree, HASH).unwrap();
         fs::create_dir(dir.path().join(".git")).unwrap();
         fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
-        detach(dir.path(), HASH).unwrap();
+        detach(&tree, HASH).unwrap();
         assert_eq!(
             fs::read_to_string(dir.path().join(".git/HEAD")).unwrap(),
             format!("{HASH}\n")
+        );
+        assert_eq!(fs::read_dir(dir.path().join(".git")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn detach_and_head_never_follow_a_symlinked_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("other");
+        fs::create_dir(&other).unwrap();
+        fs::write(other.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        let copy = dir.path().join("copy");
+        fs::create_dir_all(copy.join(".git/refs/heads")).unwrap();
+        fs::write(copy.join(".git/refs/heads/main"), HASH).unwrap();
+        std::os::unix::fs::symlink(other.join("HEAD"), copy.join(".git/HEAD")).unwrap();
+        let tree = File::from(at::open_dir(&copy).unwrap());
+        assert_eq!(head(reader(&tree)), None);
+        detach(&tree, HASH).unwrap();
+        assert_eq!(
+            fs::read_to_string(other.join("HEAD")).unwrap(),
+            "ref: refs/heads/main\n"
         );
     }
 }

@@ -8,9 +8,10 @@ use std::io::ErrorKind;
 
 use serde::{Deserialize, Serialize};
 
-use super::snapshot::SnapshotRecord;
+use super::snapshot::{self, SnapshotRecord};
 use super::{
-    FORMAT, SNAPSHOTS, Store, TRASH, WORKTREES, fs_error, list_dir, read_record, write_record,
+    FORMAT, SNAPSHOTS, Store, TRASH, WORKTREES, damaged, fs_error, is_id, list_dir, read_record,
+    write_record,
 };
 use crate::envelope::Warning;
 use crate::error::{Error, Reason};
@@ -42,6 +43,22 @@ impl Kind {
             Kind::Worktree => WORKTREE_DIR,
         }
     }
+
+    const ALL: [Kind; 2] = [Kind::Snapshot, Kind::Worktree];
+
+    /// What the IDs of this kind start with.
+    const fn prefix(self) -> &'static str {
+        match self {
+            Kind::Snapshot => "snap",
+            Kind::Worktree => "wt",
+        }
+    }
+}
+
+/// Whether `name` could be a trash entry: the ID of something the trash holds.
+fn is_entry(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| Kind::ALL.iter().any(|kind| is_id(kind.prefix(), name)))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +108,7 @@ pub struct Restored {
 impl Store {
     /// Everything in the trash, most recently deleted first.
     pub fn trash(&self) -> Result<Vec<TrashEntry>, Error> {
+        let _acting = self.act()?;
         if !self.exists()? {
             return Ok(Vec::new());
         }
@@ -134,6 +152,7 @@ impl Store {
 
     /// Put a trashed snapshot or worktree back.
     pub fn restore(&self, id: &str) -> Result<Restored, Error> {
+        let _acting = self.act()?;
         if !self.exists()? {
             return Err(self.trash_not_found(id));
         }
@@ -207,9 +226,11 @@ impl Store {
         })
     }
 
-    /// Delete everything in the trash for good, and every layer that no live
-    /// snapshot uses.
-    pub fn empty_trash(&self) -> Result<Emptied, Error> {
+    /// Delete the trash entries named in `ids` for good, and every layer that no
+    /// live snapshot uses. `ids` are the entries the caller showed and had
+    /// approved, so anything deleted since stays in the trash.
+    pub fn empty_trash(&self, ids: &[String]) -> Result<Emptied, Error> {
+        let _acting = self.act()?;
         if !self.exists()? {
             return Ok(Emptied {
                 entries: Vec::new(),
@@ -217,7 +238,11 @@ impl Store {
             });
         }
         let (guard, mut warnings) = self.open_for_change()?;
-        let records = self.trash_records()?;
+        let records: Vec<EntryRecord> = self
+            .trash_records()?
+            .into_iter()
+            .filter(|record| ids.contains(&record.id))
+            .collect();
         let scratch = self.scratch(&guard)?;
         for record in &records {
             let from = self.join(TRASH).join(&record.id);
@@ -238,8 +263,12 @@ impl Store {
     pub(crate) fn trashed_snapshots(&self) -> Result<Vec<SnapshotRecord>, Error> {
         let mut records = Vec::new();
         for entry in list_dir(&self.join(TRASH))? {
-            let path = self.join(TRASH).join(entry).join(SNAPSHOT_FILE);
+            if !is_entry(&entry) {
+                continue;
+            }
+            let path = self.join(TRASH).join(&entry).join(SNAPSHOT_FILE);
             if let Some(record) = read_record::<SnapshotRecord>(&path)? {
+                snapshot::check(&record, &path, entry.to_str().unwrap_or_default())?;
                 records.push(record);
             }
         }
@@ -251,11 +280,21 @@ impl Store {
     fn trash_records(&self) -> Result<Vec<EntryRecord>, Error> {
         let mut records = Vec::new();
         for entry in list_dir(&self.join(TRASH))? {
+            if !is_entry(&entry) {
+                continue;
+            }
             let dir = self.join(TRASH).join(&entry);
-            let Some(record) = read_record::<EntryRecord>(&dir.join(ENTRY_FILE))? else {
+            let path = dir.join(ENTRY_FILE);
+            let Some(record) = read_record::<EntryRecord>(&path)? else {
                 continue;
             };
-            if dir.join(record.kind.payload()).exists() {
+            if !is_id(record.kind.prefix(), &record.id) || entry.to_str() != Some(&record.id) {
+                return Err(damaged(
+                    &path,
+                    format!("its ID {:?} isn't the entry's name", record.id),
+                ));
+            }
+            if fs::symlink_metadata(dir.join(record.kind.payload())).is_ok() {
                 records.push(record);
             }
         }
@@ -271,11 +310,16 @@ impl Store {
     pub(crate) fn repair_trash(&self) -> Result<Vec<Warning>, Error> {
         let mut warnings = Vec::new();
         for entry in list_dir(&self.join(TRASH))? {
+            if !is_entry(&entry) {
+                continue;
+            }
             let dir = self.join(TRASH).join(&entry);
             let complete = read_record::<EntryRecord>(&dir.join(ENTRY_FILE))
                 .ok()
                 .flatten()
-                .is_some_and(|record| dir.join(record.kind.payload()).exists());
+                .is_some_and(|record| {
+                    fs::symlink_metadata(dir.join(record.kind.payload())).is_ok()
+                });
             if !complete && let Err(err) = super::tree::remove(&dir) {
                 warnings.push(super::cleanup_warning(&dir, &err));
             }

@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use super::trash::Kind;
 use super::{
-    FORMAT, LAYERS, SNAPSHOTS, Store, crash_point, fs_error, git, identity, list_dir, random_id,
-    read_record, tree, validate_name, write_record,
+    FORMAT, LAYERS, SNAPSHOTS, Store, crash_point, damaged, fs_error, git, identity, is_id,
+    is_random_id, list_dir, random_id, read_record, sync_data, tree, validate_name, write_record,
 };
 use crate::envelope::{Warning, WarningReason};
 use crate::error::{Error, Reason};
@@ -102,6 +102,7 @@ pub struct Deleted {
 impl Store {
     /// Every snapshot, newest first.
     pub fn snapshots(&self) -> Result<Vec<Snapshot>, Error> {
+        let _acting = self.act()?;
         let records = self.read_snapshots()?;
         Ok(records
             .iter()
@@ -111,6 +112,7 @@ impl Store {
 
     /// The snapshot whose ID or name is `selector`.
     pub fn snapshot(&self, selector: &str) -> Result<Snapshot, Error> {
+        let _acting = self.act()?;
         let records = self.read_snapshots()?;
         let record = find(&records, selector).ok_or_else(|| self.snapshot_not_found(selector))?;
         Ok(view(record, &records))
@@ -123,6 +125,7 @@ impl Store {
         if let Some(name) = name {
             validate_name(name)?;
         }
+        let _acting = self.act()?;
         let shown = directory.display();
         let directory = fs::canonicalize(directory).map_err(|err| match err.kind() {
             ErrorKind::NotFound => Error::new(
@@ -165,14 +168,20 @@ impl Store {
         let scratch = self.scratch(&guard)?;
         drop(guard);
 
-        let copied = tree::copy(&directory, scratch.path(), identity(self.path()))?;
+        let copied = tree::copy(
+            &directory,
+            scratch.dir(),
+            scratch.path(),
+            identity(self.path()),
+        )?;
         crash_point("snapshot-import");
-        let commit = git::head(|relative| fs::read_to_string(scratch.path().join(relative)).ok());
+        let commit = git::head(git::reader(scratch.dir()));
         if let Some(commit) = &commit {
-            git::detach(scratch.path(), commit).map_err(|err| {
+            git::detach(scratch.dir(), commit).map_err(|err| {
                 fs_error(err, format!("detach HEAD in {}", scratch.path().display()))
             })?;
         }
+        sync_data(scratch.dir(), scratch.path())?;
         let record = SnapshotRecord {
             format: FORMAT,
             id: format!("snap_{}", random_id()),
@@ -241,6 +250,7 @@ impl Store {
     /// Move a snapshot to the trash. Its layers stay until the trash is emptied.
     /// Refused while another snapshot was made from it or a worktree uses it.
     pub fn delete_snapshot(&self, selector: &str) -> Result<Deleted, Error> {
+        let _acting = self.act()?;
         if !self.exists()? {
             return Err(self.snapshot_not_found(selector));
         }
@@ -317,7 +327,10 @@ impl Store {
             if !is_record {
                 continue;
             }
-            if let Some(record) = read_record::<SnapshotRecord>(&dir.join(&name))? {
+            let path = dir.join(&name);
+            if let Some(record) = read_record::<SnapshotRecord>(&path)? {
+                let id = name.to_str().and_then(|name| name.strip_suffix(".json"));
+                check(&record, &path, id.unwrap_or_default())?;
                 records.push(record);
             }
         }
@@ -356,6 +369,32 @@ impl Store {
             self.next(&["beavy", "snapshots", "list"]),
         )
     }
+}
+
+/// Check a snapshot record read from `path` before any of it becomes part of a
+/// path: its ID must be `id`, the name it was stored under.
+pub(crate) fn check(record: &SnapshotRecord, path: &Path, id: &str) -> Result<(), Error> {
+    if !is_id("snap", &record.id) || record.id != id {
+        return Err(damaged(path, format!("its ID {:?} isn't {id}", record.id)));
+    }
+    if record.layers.is_empty() || !record.layers.iter().all(is_random_id) {
+        return Err(damaged(path, "it names a layer that isn't one"));
+    }
+    if record
+        .parent
+        .as_deref()
+        .is_some_and(|parent| !is_id("snap", parent))
+    {
+        return Err(damaged(path, "its parent isn't a snapshot ID"));
+    }
+    if record
+        .name
+        .as_deref()
+        .is_some_and(|name| validate_name(name).is_err())
+    {
+        return Err(damaged(path, "its name isn't a valid name"));
+    }
+    Ok(())
 }
 
 pub(crate) fn find<'a>(

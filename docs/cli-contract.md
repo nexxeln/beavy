@@ -120,13 +120,13 @@ On failure with `--json`, stderr gets one line:
 | `missing_argument` | Missing input | 2 | `action_required` | Required input is missing and the run can't prompt for it |
 | `confirmation_required` | Missing input | 2 | `action_required` | A command that destroys data needs `--yes` in a non-interactive run |
 | `not_found` | Not found | 1 | `error` | A named file, directory, snapshot, worktree, trash entry, or command doesn't exist |
-| `permission_denied` | Permission | 1 | `error` | The process isn't allowed to read or change what was named |
+| `permission_denied` | Permission | 1 | `error` | The process isn't allowed to read or change what was named, or beavy won't use the store: it belongs to another user, other users can write to it, or, as root, another user could replace it |
 | `name_taken` | Conflict | 1 | `error` | Another snapshot or worktree in the store has the name |
 | `snapshot_in_use` | Conflict | 1 | `error` | A snapshot can't be deleted while another snapshot was made from it or a worktree uses it |
 | `worktree_in_use` | Conflict | 1 | `error` | A worktree can't be sealed, mounted, unmounted, or deleted while commands run in it or files are open in its mount |
 | `unsupported_git_state` | Conflict | 1 | `error` | The project is a linked Git worktree or submodule, or its repository is in the middle of a merge, rebase, cherry-pick, revert, or bisect |
 | `io_error` | System | 1 | `error` | The operating system failed a read or write |
-| `invalid_store` | System | 1 | `error` | The store has a layout version this beavy can't read, or a damaged record |
+| `invalid_store` | System | 1 | `error` | The store has a layout version this beavy can't read, or a damaged record, such as one whose ID isn't an ID |
 | `backend_unavailable` | System | 1 | `error` | This machine can't mount worktrees: no overlayfs, neither root nor user namespaces, or a platform other than Linux. `next` names the fix when beavy can tell it |
 | `internal_error` | Internal | 1 | `error` | A bug in beavy |
 | `canceled` | Canceled | 130 | `error` | The user declined a confirmation; nothing changed |
@@ -139,7 +139,7 @@ to `error::Reason` in the same change.
 | Reason | When |
 | --- | --- |
 | `cleanup_failed` | A temporary file or directory beavy created couldn't be removed. The message names the path |
-| `entries_skipped` | An import left out entries it can't copy: sockets, and device nodes when beavy isn't root. The message names them |
+| `entries_skipped` | An import left out entries it can't copy: sockets and device nodes. The message names them |
 | `store_on_overlayfs` | The store is on overlayfs, such as a container's root filesystem. Worktrees stack another overlay on it, which some kernels refuse and every kernel slows down |
 | `remount_failed` | A sealed worktree couldn't be mounted again at the directory it was mounted on before |
 
@@ -206,10 +206,36 @@ The project is the nearest directory at or above `--cwd` that already has a defa
 store, else the root of the Git working tree around it, else `--cwd` itself. Every
 suggested command repeats the `--cwd` and `--store` the caller passed.
 
-Reads never create a store; the first change does. Every change takes the store's
-lock and first repairs whatever an interrupted command left behind, so a killed
-command never leaves a half-made snapshot or worktree in view. A store records its
-layout version, and a beavy that can't read it fails with `invalid_store`.
+Reads never create a store; the first change does, in a directory that doesn't
+exist or is empty. A directory with anything else in it fails with
+`invalid_arguments`, so beavy never adopts, or cleans up, files it didn't make.
+Every change takes the store's lock and first repairs whatever an interrupted
+command left behind, so a killed command never leaves a half-made snapshot or
+worktree in view. Repair only touches names beavy makes. A store records its layout version,
+and a beavy that can't read it fails with `invalid_store`. beavy checks every
+record before using an ID or layer name from it as part of a path, and a record
+that fails the check fails the command with `invalid_store`. Layer data is on
+disk before the record that names it.
+
+A store belongs to the user who created it, and every file beavy reads or writes
+in a store, it reads or writes as that user:
+
+- Run as a user, beavy uses only that user's stores. A store owned by someone else
+  fails with `permission_denied`.
+- Run through `sudo`, beavy works for the user who ran sudo (`SUDO_UID` and
+  `SUDO_GID`): it creates and changes stores as that user, so nothing in a store
+  or on the way to it ends up owned by root. When sudo set `HOME` to root's home,
+  the default store is under the invoking user's home instead. A store that user
+  doesn't own fails with `permission_denied`.
+- Run as root with no invoking user, such as from a root login, beavy works in a
+  root-owned store as root and in another user's store as that user. A root-owned
+  store fails with `permission_denied` when a directory on the way to it belongs
+  to another user or is writable by others without the sticky bit, because that
+  user could replace it while beavy works.
+
+beavy refuses a store that users other than its owner can write, with
+`permission_denied` and a next command that removes their write access.
+
 Snapshots and worktrees need Linux; on other platforms these commands fail with
 `backend_unavailable`.
 
@@ -299,7 +325,9 @@ beavy snapshots create [--name <NAME>] [--worktree <WORKTREE>] [--store <DIR>] [
 Without `--worktree`, the command copies the project into the store once. It clones
 files with `FICLONE` when the filesystem supports reflinks and copies them
 otherwise. It keeps modes, times, symlinks, FIFOs, and hard links, and ownership
-only as root. It skips sockets and device nodes with an `entries_skipped` warning.
+only when it works as root. It never reads or writes through a symlink, and each
+file keeps the owner and mode of the file it actually read. It skips sockets and
+device nodes with an `entries_skipped` warning.
 The project itself is only read, and never becomes part of a mount. In the copy,
 Git's HEAD is detached at the current commit, with the index and working tree as
 they were. A linked Git worktree or submodule fails with `unsupported_git_state`
@@ -397,6 +425,8 @@ beavy trash empty [-y, --yes] [--store <DIR>] [--json]
 ```
 
 Deletes everything in the trash for good, with the layers no live snapshot uses.
+It deletes only the entries it counted before asking, so an entry trashed while
+the question was open stays in the trash.
 An interactive run asks first; declining exits 130 with `canceled`. A
 non-interactive run needs `--yes`, and without it fails with
 `confirmation_required` (exit 2) and a next command whose `when` says to run it

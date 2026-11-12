@@ -17,14 +17,18 @@
 //! everything it names is in place, so a crash leaves either the old state or the
 //! new one, plus leftovers in tmp/ and unreferenced layers. The next command that
 //! changes the store removes those leftovers before it does anything else.
+//!
+//! Every file system call in a store runs as the store's owner (see [`owner`]),
+//! and beavy refuses a store that anyone else can write. Records are untrusted
+//! input: an ID or layer name is checked before it becomes part of a path.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
@@ -33,8 +37,10 @@ use serde::{Deserialize, Serialize};
 use crate::envelope::{Warning, WarningReason};
 use crate::error::{Error, Next, Reason};
 
+mod at;
 mod git;
 mod overlay;
+mod owner;
 mod snapshot;
 mod squash;
 mod trash;
@@ -112,7 +118,7 @@ pub fn locate(
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .or_else(|| {
-            env("HOME")
+            owner::store_home(env("HOME"))
                 .filter(|home| !home.is_empty())
                 .map(|home| PathBuf::from(home).join(".local/share"))
         });
@@ -205,7 +211,7 @@ pub(crate) struct Guard {
 /// unless it was moved into place with [`Scratch::persist`].
 pub(crate) struct Scratch {
     path: PathBuf,
-    _lock: File,
+    dir: File,
     persisted: bool,
 }
 
@@ -214,10 +220,25 @@ impl Scratch {
         &self.path
     }
 
-    /// Rename the directory to `target`, which must be on the same filesystem.
+    /// The directory, open and locked. Work inside it goes through this
+    /// descriptor, so renaming tmp/<entry> can't redirect it.
+    pub(crate) fn dir(&self) -> &File {
+        &self.dir
+    }
+
+    /// Rename the directory to `target`, which must be on the same filesystem, and
+    /// check that what arrived there is this directory.
     pub(crate) fn persist(mut self, target: &Path) -> io::Result<()> {
         fs::rename(&self.path, target)?;
         self.persisted = true;
+        let moved = fs::symlink_metadata(target)?;
+        let dir = self.dir.metadata()?;
+        if (moved.dev(), moved.ino()) != (dir.dev(), dir.ino()) {
+            return Err(io::Error::other(format!(
+                "{} was replaced while beavy worked in it",
+                self.path.display()
+            )));
+        }
         Ok(())
     }
 
@@ -285,6 +306,88 @@ impl Store {
         fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone())
     }
 
+    /// Act as the store's owner on this thread until the guard drops. Every public
+    /// operation starts here. A store that doesn't exist yet will belong to the
+    /// caller. Refuses a store that users other than its owner can write, a store
+    /// that belongs to someone else unless beavy is root without sudo, and, when
+    /// beavy works as root, a store that another user could move or replace.
+    pub(crate) fn act(&self) -> Result<owner::Acting, Error> {
+        let shown = self.root.display();
+        let caller = owner::caller();
+        let identity = match fs::symlink_metadata(&self.root) {
+            Err(err) if err.kind() == ErrorKind::NotFound => caller,
+            Err(err) => return Err(fs_error(err, format!("read store {shown}"))),
+            Ok(metadata) => {
+                if !metadata.is_dir() {
+                    return Err(Error::new(
+                        Reason::InvalidArguments,
+                        format!("Can't use store {shown}. It isn't a directory."),
+                    ));
+                }
+                if metadata.mode() & 0o022 != 0 {
+                    return Err(Error::new(
+                        Reason::PermissionDenied,
+                        format!(
+                            "Can't use store {shown}. Users other than its owner can write to it."
+                        ),
+                    )
+                    .with_next(
+                        "Make it writable only by its owner",
+                        Next::new(["chmod", "go-w", &shown.to_string()]),
+                    ));
+                }
+                let uid = metadata.uid();
+                if uid == caller.uid {
+                    caller
+                } else if owner::privileged() && owner::sudo_caller().is_none() {
+                    owner::Identity::of(uid, owner::primary_gid(uid).unwrap_or(metadata.gid()))
+                } else {
+                    return Err(Error::new(
+                        Reason::PermissionDenied,
+                        format!(
+                            "Can't use store {shown}. It belongs to {}, and beavy only uses a store as its owner.",
+                            owner::name_of(uid)
+                        ),
+                    ));
+                }
+            }
+        };
+        if identity.uid == 0 && owner::privileged() {
+            self.check_root_path()?;
+        }
+        owner::act_as(&identity).map_err(|err| fs_error(err, format!("use store {shown}")))
+    }
+
+    /// Working as root, refuse a store when a directory on the way to it belongs to
+    /// another user or is writable by others without the sticky bit, because that
+    /// user could replace the store while beavy works in it.
+    fn check_root_path(&self) -> Result<(), Error> {
+        for dir in self.root.ancestors() {
+            let metadata = match fs::symlink_metadata(dir) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(err) => return Err(fs_error(err, format!("read {}", dir.display()))),
+            };
+            let shared = metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0;
+            if metadata.uid() != 0 || shared {
+                let who = if metadata.uid() != 0 {
+                    format!("belongs to {}", owner::name_of(metadata.uid()))
+                } else {
+                    "is writable by other users".to_owned()
+                };
+                return Err(Error::new(
+                    Reason::PermissionDenied,
+                    format!(
+                        "Can't use store {} as root. {} {who}, who could replace the store while beavy works in it.",
+                        self.root.display(),
+                        dir.display()
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Whether the store exists, after checking that this beavy can read it.
     pub(crate) fn exists(&self) -> Result<bool, Error> {
         let marker = self.join(STORE_FILE);
@@ -315,10 +418,36 @@ impl Store {
         Ok((guard, warnings))
     }
 
+    /// Make the store in a new or empty directory. A directory with anything in it
+    /// is refused: beavy removes what it doesn't recognize from tmp/ and layers/, so
+    /// it never adopts a directory it didn't create.
     fn create(&self) -> Result<(), Error> {
         let shown = self.root.display();
-        fs::create_dir_all(&self.root)
-            .map_err(|err| fs_error(err, format!("create store {shown}")))?;
+        match fs::read_dir(&self.root) {
+            Ok(mut entries) => {
+                if entries.next().is_some() {
+                    return Err(Error::new(
+                        Reason::InvalidArguments,
+                        format!(
+                            "Can't create a store in {shown}. The directory isn't empty, and it isn't a beavy store."
+                        ),
+                    ));
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                if let Some(parent) = self.root.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|err| fs_error(err, format!("create store {shown}")))?;
+                }
+                match fs::DirBuilder::new().mode(0o700).create(&self.root) {
+                    Err(err) if err.kind() != ErrorKind::AlreadyExists => {
+                        return Err(fs_error(err, format!("create store {shown}")));
+                    }
+                    _ => {}
+                }
+            }
+            Err(err) => return Err(fs_error(err, format!("read {shown}"))),
+        }
         for dir in [LAYERS, SNAPSHOTS, WORKTREES, TRASH, TMP] {
             let path = self.join(dir);
             match fs::create_dir(&path) {
@@ -340,6 +469,7 @@ impl Store {
             .create(true)
             .truncate(false)
             .mode(0o644)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&path)
             .map_err(|err| fs_error(err, format!("open {}", path.display())))?;
         lock_file(&file, libc::LOCK_EX)
@@ -351,25 +481,33 @@ impl Store {
     /// sees it before it's locked.
     pub(crate) fn scratch(&self, _guard: &Guard) -> Result<Scratch, Error> {
         let path = self.join(TMP).join(random_id());
-        fs::create_dir(&path).map_err(|err| fs_error(err, format!("create {}", path.display())))?;
-        let lock = File::open(&path)
-            .and_then(|file| lock_file(&file, libc::LOCK_EX).map(|()| file))
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .map_err(|err| fs_error(err, format!("create {}", path.display())))?;
+        let dir = at::open_dir(&path)
+            .map(File::from)
+            .and_then(|dir| lock_file(&dir, libc::LOCK_EX).map(|()| dir))
             .map_err(|err| fs_error(err, format!("lock {}", path.display())))?;
         Ok(Scratch {
             path,
-            _lock: lock,
+            dir,
             persisted: false,
         })
     }
 
     /// Remove leftovers of interrupted commands: tmp/ entries no process holds,
     /// half-written records and trash entries, and layers no snapshot uses. Finish
-    /// interrupted seals, and detach mounts of worktrees that no longer exist.
+    /// interrupted seals, and detach mounts of worktrees that no longer exist. Only
+    /// names beavy makes are touched.
     fn repair(&self, guard: &Guard) -> Result<Vec<Warning>, Error> {
         let mut warnings = Vec::new();
         for entry in list_dir(&self.join(TMP))? {
+            if !is_random_id(&entry) {
+                continue;
+            }
             let path = self.join(TMP).join(&entry);
-            let Ok(file) = File::open(&path) else {
+            let Ok(file) = at::open_dir(&path).map(File::from) else {
                 continue;
             };
             if try_lock_file(&file, libc::LOCK_EX).unwrap_or(false)
@@ -379,7 +517,7 @@ impl Store {
             }
         }
         for entry in list_dir(&self.join(SNAPSHOTS))? {
-            if entry.as_bytes().starts_with(b".") {
+            if is_temporary_record(&entry) {
                 let _ = fs::remove_file(self.join(SNAPSHOTS).join(entry));
             }
         }
@@ -404,6 +542,7 @@ impl Store {
         }
         let unused: Vec<OsString> = list_dir(&self.join(LAYERS))?
             .into_iter()
+            .filter(|layer| is_random_id(layer))
             .filter(|layer| !layer.to_str().is_some_and(|layer| used.contains(layer)))
             .collect();
         if unused.is_empty() {
@@ -435,9 +574,19 @@ pub(crate) fn list_dir(path: &Path) -> Result<Vec<OsString>, Error> {
     Ok(names)
 }
 
-/// Read a JSON record, or `None` when the file doesn't exist.
+/// Read a JSON record, or `None` when the file doesn't exist. A symlink is never
+/// followed.
 pub(crate) fn read_record<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, Error> {
-    let bytes = match fs::read(path) {
+    let read = || -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?
+            .read_to_end(&mut bytes)?;
+        Ok(bytes)
+    };
+    let bytes = match read() {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(fs_error(err, format!("read {}", path.display()))),
@@ -481,9 +630,53 @@ pub(crate) fn write_record<T: Serialize>(dir: &Path, name: &str, record: &T) -> 
     write().map_err(|err| fs_error(err, format!("write {}", target.display())))
 }
 
+const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
+
+/// Whether `name` has the shape of [`random_id`]: the names of layers and tmp/
+/// entries.
+pub(crate) fn is_random_id(name: impl AsRef<std::ffi::OsStr>) -> bool {
+    let name = name.as_ref().as_bytes();
+    name.len() == 10 && name.iter().all(|b| ALPHABET.contains(b))
+}
+
+/// Whether `id` is `prefix`, an underscore, and a [`random_id`], such as
+/// `snap_0123456789`.
+pub(crate) fn is_id(prefix: &str, id: &str) -> bool {
+    id.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('_'))
+        .is_some_and(is_random_id)
+}
+
+/// A temporary file [`write_record`] left: `.<name>.<random id>`.
+fn is_temporary_record(name: &std::ffi::OsStr) -> bool {
+    let name = name.as_bytes();
+    name.len() > 12
+        && name.starts_with(b".")
+        && name[name.len() - 11] == b'.'
+        && is_random_id(std::ffi::OsStr::from_bytes(&name[name.len() - 10..]))
+}
+
+/// A record whose contents can't be right, such as an ID that isn't one.
+pub(crate) fn damaged(path: &Path, problem: impl AsRef<str>) -> Error {
+    Error::new(
+        Reason::InvalidStore,
+        format!(
+            "Can't use {}. It isn't a valid beavy record: {}.",
+            path.display(),
+            problem.as_ref()
+        ),
+    )
+}
+
+/// Write everything on the filesystem that holds `dir` to disk, so a record never
+/// names data a power loss could take away.
+pub(crate) fn sync_data(dir: &File, shown: &Path) -> Result<(), Error> {
+    rustix::fs::syncfs(dir)
+        .map_err(|err| fs_error(err.into(), format!("write {} to disk", shown.display())))
+}
+
 /// Ten random characters from a lowercase alphabet without look-alikes.
 pub(crate) fn random_id() -> String {
-    const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
     let mut bytes = [0u8; 10];
     let mut filled = 0;
     while filled < bytes.len() {
@@ -711,9 +904,10 @@ mod tests {
         let (guard, warnings) = store.open_for_change().unwrap();
         assert!(warnings.is_empty());
         let kept = store.scratch(&guard).unwrap();
-        fs::create_dir(store.join(TMP).join("stale")).unwrap();
-        fs::create_dir_all(store.join(LAYERS).join("orphan/sub")).unwrap();
-        fs::write(store.join(SNAPSHOTS).join(".x.json.tmp"), b"").unwrap();
+        fs::create_dir(store.join(TMP).join(random_id())).unwrap();
+        fs::create_dir_all(store.join(LAYERS).join(random_id()).join("sub")).unwrap();
+        let temporary = format!(".snap_0123456789.json.{}", random_id());
+        fs::write(store.join(SNAPSHOTS).join(temporary), b"").unwrap();
         drop(guard);
         let (_guard, warnings) = store.open_for_change().unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
@@ -723,5 +917,42 @@ mod tests {
         );
         assert!(list_dir(&store.join(LAYERS)).unwrap().is_empty());
         assert!(list_dir(&store.join(SNAPSHOTS)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_store_is_made_only_in_an_empty_directory_and_repair_keeps_foreign_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        fs::create_dir_all(data.join("tmp/build-cache")).unwrap();
+        fs::create_dir_all(data.join("layers/photos")).unwrap();
+        let err = Store::at(&data).open_for_change().err().unwrap();
+        assert_eq!(err.reason(), Reason::InvalidArguments);
+        assert!(data.join("tmp/build-cache").exists());
+        assert!(data.join("layers/photos").exists());
+
+        let store = Store::at(dir.path().join("store"));
+        drop(store.open_for_change().unwrap());
+        for (dir, name) in [(TMP, "notes"), (LAYERS, "photos"), (TRASH, "keep")] {
+            fs::create_dir(store.join(dir).join(name)).unwrap();
+        }
+        fs::write(store.join(SNAPSHOTS).join(".hidden"), b"").unwrap();
+        drop(store.open_for_change().unwrap());
+        for (dir, name) in [
+            (TMP, "notes"),
+            (LAYERS, "photos"),
+            (TRASH, "keep"),
+            (SNAPSHOTS, ".hidden"),
+        ] {
+            assert!(store.join(dir).join(name).exists(), "{dir}/{name}");
+        }
+        assert!(is_id("snap", "snap_0123456789"));
+        for bad in [
+            "snap_012345678",
+            "snap_../../xx",
+            "wt_0123456789",
+            "snap_ABCDEFGHJK",
+        ] {
+            assert!(!is_id("snap", bad), "{bad}");
+        }
     }
 }

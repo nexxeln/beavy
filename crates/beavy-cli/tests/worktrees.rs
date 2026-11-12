@@ -87,6 +87,9 @@ impl Fixture {
             .env("BEAVY_STORE", &self.store)
             .env_remove("XDG_DATA_HOME")
             .env_remove("__BEAVY_CRASH_AT")
+            .env_remove("SUDO_UID")
+            .env_remove("SUDO_GID")
+            .env_remove("SUDO_USER")
             .stdin(Stdio::null());
         command
     }

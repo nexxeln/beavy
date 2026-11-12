@@ -4,6 +4,8 @@
 #![cfg(target_os = "linux")]
 
 use std::fs;
+use std::io::{Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -43,8 +45,32 @@ impl Fixture {
             .env("BEAVY_STORE", &self.store)
             .env_remove("XDG_DATA_HOME")
             .env_remove("__BEAVY_CRASH_AT")
+            .env_remove("SUDO_UID")
+            .env_remove("SUDO_GID")
+            .env_remove("SUDO_USER")
             .stdin(Stdio::null());
         command
+    }
+
+    /// beavy as root through sudo, run by `uid`.
+    fn sudo(&self, args: &[&str], (uid, gid): (u32, u32)) -> Command {
+        let mut command = self.beavy(args);
+        command
+            .env("SUDO_UID", uid.to_string())
+            .env("SUDO_GID", gid.to_string());
+        command
+    }
+
+    /// Hand everything in the fixture to `uid`, as if that user had made it.
+    fn give_to(&self, (uid, gid): (u32, u32)) {
+        let root = self.home.parent().unwrap();
+        let status = Command::new("chown")
+            .arg("-R")
+            .arg(format!("{uid}:{gid}"))
+            .arg(root)
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     fn output(&self, args: &[&str]) -> Output {
@@ -91,6 +117,28 @@ impl Fixture {
 fn error(output: &Output) -> Value {
     assert!(output.stdout.is_empty());
     serde_json::from_slice(&output.stderr).expect("one JSON error")
+}
+
+/// When the tests run as root, the user that stands in for the one who ran sudo.
+fn sudo_user() -> Option<(u32, u32)> {
+    // SAFETY: geteuid has no preconditions.
+    (unsafe { libc::geteuid() } == 0).then_some((65534, 65534))
+}
+
+/// Every path under `root`, `root` included.
+fn walk(root: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![root.to_path_buf()];
+    let mut next = 0;
+    while next < paths.len() {
+        let path = paths[next].clone();
+        next += 1;
+        if fs::symlink_metadata(&path).unwrap().is_dir() {
+            for entry in fs::read_dir(&path).unwrap() {
+                paths.push(entry.unwrap().path());
+            }
+        }
+    }
+    paths
 }
 
 #[test]
@@ -319,6 +367,210 @@ fn interrupted_imports_and_deletes_are_repaired() {
         f.json(&["snapshots", "inspect", &id])["snapshot"]["id"],
         id.as_str()
     );
+}
+
+#[test]
+fn a_store_is_made_only_in_an_empty_directory() {
+    let f = Fixture::new();
+    let data = f.home.join("data");
+    fs::create_dir_all(data.join("tmp/build-cache")).unwrap();
+    fs::create_dir_all(data.join("layers/photos")).unwrap();
+    let refused = f.output(&[
+        "snapshots",
+        "create",
+        "--store",
+        data.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(refused.status.code(), Some(2));
+    assert_eq!(error(&refused)["reason"], "invalid_arguments");
+    assert!(data.join("tmp/build-cache").is_dir());
+    assert!(data.join("layers/photos").is_dir());
+    assert!(!data.join("store.json").exists());
+}
+
+#[test]
+fn record_ids_never_become_paths_outside_the_store() {
+    let f = Fixture::new();
+    let victim = f.home.join("victim");
+    fs::create_dir(&victim).unwrap();
+    fs::write(victim.join("data"), "keep").unwrap();
+
+    let id = f.ok(&["snapshots", "create"]).trim().to_string();
+    let record = f.store.join("snapshots").join(format!("{id}.json"));
+    let text = fs::read_to_string(&record).unwrap();
+    let layer = &f.entries("layers")[0];
+    fs::write(&record, text.replace(layer.as_str(), "../../home/victim")).unwrap();
+    let refused = f.output(&["snapshots", "list", "--json"]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert_eq!(error(&refused)["reason"], "invalid_store");
+    fs::write(&record, text).unwrap();
+
+    f.ok(&["snapshots", "delete", &id]);
+    let entry = f.store.join("trash").join(&id).join("entry.json");
+    let text = fs::read_to_string(&entry).unwrap();
+    fs::write(&entry, text.replace(&id, "../../home/victim")).unwrap();
+    let refused = f.output(&["trash", "empty", "--yes", "--json"]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert_eq!(error(&refused)["reason"], "invalid_store");
+    assert_eq!(fs::read_to_string(victim.join("data")).unwrap(), "keep");
+}
+
+#[test]
+fn a_symlinked_head_is_never_written_through() {
+    let f = Fixture::new();
+    f.git(&["init", "-q", "-b", "main"]);
+    f.git(&["add", "."]);
+    f.git(&["commit", "-q", "-m", "first"]);
+    let other = f.home.join("other.git");
+    fs::create_dir(&other).unwrap();
+    fs::write(other.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    let head = f.project.join(".git/HEAD");
+    fs::remove_file(&head).unwrap();
+    std::os::unix::fs::symlink(other.join("HEAD"), &head).unwrap();
+
+    f.ok(&["snapshots", "create"]);
+    assert_eq!(
+        fs::read_to_string(other.join("HEAD")).unwrap(),
+        "ref: refs/heads/main\n"
+    );
+}
+
+#[test]
+fn emptying_the_trash_deletes_only_what_was_approved() {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    let f = Fixture::new();
+    let first = f.ok(&["snapshots", "create"]).trim().to_string();
+    let second = f.ok(&["snapshots", "create"]).trim().to_string();
+    f.ok(&["snapshots", "delete", &first]);
+
+    let (mut controller, mut terminal) = (0, 0);
+    // SAFETY: both out pointers are valid; null name, termios, and winsize are allowed.
+    let rc = unsafe {
+        libc::openpty(
+            &mut controller,
+            &mut terminal,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
+    // SAFETY: openpty returned two open descriptors that nothing else owns.
+    let (controller, terminal) = unsafe {
+        (
+            OwnedFd::from_raw_fd(controller),
+            OwnedFd::from_raw_fd(terminal),
+        )
+    };
+    let child = Command::new(env!("CARGO_BIN_EXE_beavy"))
+        .args(["trash", "empty"])
+        .current_dir(&f.project)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", &f.home)
+        .env("BEAVY_STORE", &f.store)
+        .env("TERM", "xterm")
+        .stdin(Stdio::from(terminal.try_clone().unwrap()))
+        .stderr(Stdio::from(terminal))
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut screen = fs::File::from(controller);
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !String::from_utf8_lossy(&seen).contains("Empty the trash?") {
+        match screen.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => seen.extend_from_slice(&buf[..n]),
+        }
+    }
+    let prompt = String::from_utf8_lossy(&seen).into_owned();
+    assert!(prompt.contains("Deletes 1 snapshot"), "{prompt}");
+
+    f.ok(&["snapshots", "delete", &second]);
+    screen.write_all(b"y\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let left = f.json(&["trash", "list"])["entries"].clone();
+    assert_eq!(left.as_array().unwrap().len(), 1, "{left}");
+    assert_eq!(left[0]["id"], second.as_str());
+}
+
+#[test]
+fn through_sudo_the_store_belongs_to_the_user_who_ran_it() {
+    let Some(user) = sudo_user() else {
+        return;
+    };
+    let f = Fixture::new();
+    f.give_to(user);
+    let created = f
+        .sudo(&["snapshots", "create"], user)
+        .env_remove("BEAVY_STORE")
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let local = f.home.join(".local");
+    let store = walk(&local);
+    assert!(store.len() > 8, "{store:?}");
+    for path in store {
+        let owner = fs::symlink_metadata(&path).unwrap().uid();
+        assert_eq!(owner, user.0, "{}", path.display());
+    }
+
+    let refused = f.output(&["snapshots", "create", "--json"]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert_eq!(error(&refused)["reason"], "permission_denied");
+
+    let dir = tempfile::tempdir().unwrap();
+    let rooted = dir.path().join("store");
+    let rooted = rooted.to_str().unwrap();
+    assert!(
+        f.output(&["snapshots", "create", "--store", rooted])
+            .status
+            .success()
+    );
+    let refused = f
+        .sudo(&["snapshots", "list", "--store", rooted, "--json"], user)
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(1));
+    assert_eq!(error(&refused)["reason"], "permission_denied");
+}
+
+#[test]
+fn through_sudo_beavy_never_follows_a_link_in_the_store() {
+    let Some(user) = sudo_user() else {
+        return;
+    };
+    let f = Fixture::new();
+    f.give_to(user);
+    let created = f.sudo(&["snapshots", "create"], user).output().unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let guarded = tempfile::tempdir().unwrap();
+    let proof = guarded.path().join("proof");
+    fs::remove_file(f.store.join("lock")).unwrap();
+    std::os::unix::fs::symlink(&proof, f.store.join("lock")).unwrap();
+    let refused = f.sudo(&["snapshots", "create"], user).output().unwrap();
+    assert!(!refused.status.success());
+    assert!(!proof.exists());
+
+    fs::remove_file(f.store.join("lock")).unwrap();
+    let created = f.output(&["snapshots", "create"]);
+    assert!(created.status.success());
+    for path in walk(&f.store) {
+        let owner = fs::symlink_metadata(&path).unwrap().uid();
+        assert_eq!(owner, user.0, "{}", path.display());
+    }
 }
 
 #[test]
