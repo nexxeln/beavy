@@ -672,6 +672,16 @@ fn background_jobs_never_block_later_runs_or_outlive_a_seal() {
 }
 
 #[test]
+fn a_directory_the_worktree_lacks_starts_the_command_at_the_project() {
+    let Some(f) = Fixture::new() else { return };
+    let wt = f.create("base");
+    f.sh(&wt, "rm -r src");
+    let mut command = f.beavy(&["worktrees", "run", &wt, "--", "pwd"]);
+    command.current_dir(f.project.join("src"));
+    assert_eq!(succeed(command), f.project.display().to_string());
+}
+
+#[test]
 fn worktree_records_are_checked_before_their_ids_become_paths() {
     let Some(f) = Fixture::new() else { return };
     let victim = f.home.join("victim");

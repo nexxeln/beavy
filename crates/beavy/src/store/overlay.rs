@@ -466,10 +466,12 @@ pub(crate) struct Enter {
     pub entry: Entry,
     pub privilege: Privilege,
     pub maps: IdMaps,
-    /// The directory the worktree covers, open: the path its snapshot was
-    /// imported from, which the worktree is mounted on.
+    /// The directory the worktree covers: the path its snapshot was imported from.
+    pub target: CString,
+    /// `target`, open: what the worktree is mounted on.
     pub point: Opened,
-    /// The command's working directory, resolved again after the mount.
+    /// The command's working directory, resolved again after the mount. When the
+    /// worktree doesn't have it, the command starts in `target`.
     pub cwd: CString,
     /// A descriptor to keep open across exec: the lock that marks the run as live.
     pub keep: RawFd,
@@ -519,9 +521,11 @@ impl Enter {
                 }
             }
         }
-        // SAFETY: cwd is NUL-terminated; keep is an open descriptor.
+        // SAFETY: cwd and target are NUL-terminated; keep is an open descriptor.
         unsafe {
-            if libc::chdir(self.cwd.as_ptr()) != 0 {
+            if libc::chdir(self.cwd.as_ptr()) != 0
+                && (errno() != libc::ENOENT || libc::chdir(self.target.as_ptr()) != 0)
+            {
                 return Err((STAGE_CHDIR, errno()));
             }
             if libc::fcntl(self.keep, libc::F_SETFD, 0) != 0 {

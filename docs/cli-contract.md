@@ -494,8 +494,9 @@ beavy worktrees run <WORKTREE> [--store <DIR>] -- <COMMAND> [ARG]...
 Runs a command in the worktree. The command gets its own mount namespace with the
 worktree mounted over the worktree's `path`, so it sees the project at its usual
 path while nothing outside it sees the worktree. It starts in the current
-directory when that's inside `path`, and in `path` otherwise, with
-`BEAVY_WORKTREE` set. The mount has no setuid or device files (`nosuid,nodev`).
+directory when that's inside `path` and the worktree has it, and in `path`
+otherwise, with `BEAVY_WORKTREE` set. The mount has no setuid or device files
+(`nosuid,nodev`).
 
 beavy enters the namespace and then replaces itself with the command, so the
 command keeps beavy's process ID, stdin, stdout, stderr, and signals, runs as the

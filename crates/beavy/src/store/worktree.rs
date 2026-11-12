@@ -556,6 +556,7 @@ impl Store {
             entry,
             privilege,
             maps: IdMaps::identity(),
+            target: c_path(&target)?,
             point,
             cwd: c_path(&cwd)?,
             keep: run.as_raw_fd(),
