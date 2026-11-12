@@ -497,10 +497,12 @@ directory when that's inside `path`, and in `path` otherwise, with
 
 beavy enters the namespace and then replaces itself with the command, so the
 command keeps beavy's process ID, stdin, stdout, stderr, and signals, runs as the
-caller's own user and group, and its exit status is beavy's. beavy writes nothing
-once the command starts, even with `--json`. Failures before it starts follow
-the contract: `not_found` for an unknown worktree or command,
-`backend_unavailable` when the mount fails.
+caller's own user and group, and its exit status is beavy's. Through `sudo`, the
+caller is the user who ran sudo: the command runs as that user, with their groups;
+a root login runs commands as root. beavy writes nothing once the command starts,
+even with `--json`. Failures before it starts follow the contract: `not_found` for
+an unknown worktree or command, `backend_unavailable` when the mount fails,
+`permission_denied` when the command can't run as the user who ran sudo.
 
 Commands in one worktree may run at the same time. The first mounts the worktree
 and later ones join its mount namespace, so a worktree is never mounted twice. A

@@ -9,6 +9,7 @@
 
 use std::fs;
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -136,6 +137,54 @@ impl Fixture {
         String::from_utf8(output.stdout).unwrap()
     }
 
+    /// beavy as root through sudo, run by `user`.
+    fn sudo(&self, args: &[&str], (uid, gid): (u32, u32)) -> Command {
+        let mut command = self.beavy(args);
+        command
+            .env("SUDO_UID", uid.to_string())
+            .env("SUDO_GID", gid.to_string());
+        command
+    }
+
+    /// beavy as `user`, with no privilege. Run `give_to` first.
+    fn as_user(&self, args: &[&str], (uid, gid): (u32, u32)) -> Command {
+        let mut command = Command::new("setpriv");
+        command
+            .args([
+                &format!("--reuid={uid}"),
+                &format!("--regid={gid}"),
+                "--clear-groups",
+            ])
+            .arg(self.home.with_file_name("beavy"))
+            .args(args)
+            .current_dir(&self.project)
+            .env("HOME", &self.home)
+            .env("BEAVY_STORE", &self.store)
+            .env_remove("XDG_DATA_HOME")
+            .env_remove("__BEAVY_CRASH_AT")
+            .env_remove("SUDO_UID")
+            .env_remove("SUDO_GID")
+            .env_remove("SUDO_USER")
+            .stdin(Stdio::null());
+        command
+    }
+
+    /// Hand everything in the fixture, and a copy of beavy, to `user`.
+    fn give_to(&self, (uid, gid): (u32, u32)) {
+        fs::copy(
+            env!("CARGO_BIN_EXE_beavy"),
+            self.home.with_file_name("beavy"),
+        )
+        .unwrap();
+        let status = Command::new("chown")
+            .arg("-R")
+            .arg(format!("{uid}:{gid}"))
+            .arg(self.home.parent().unwrap())
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
     fn entries(&self, dir: &str) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(self.store.join(dir))
             .unwrap()
@@ -148,6 +197,42 @@ impl Fixture {
 
 fn document(bytes: &[u8]) -> Value {
     serde_json::from_slice(bytes).expect("one JSON document")
+}
+
+/// Run `command`, assert it succeeded, and return its stdout without the newline.
+fn succeed(mut command: Command) -> String {
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{command:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .trim_end()
+        .to_string()
+}
+
+/// The user a root test acts as through sudo, or None when not root.
+fn sudo_user() -> Option<(u32, u32)> {
+    // SAFETY: geteuid has no preconditions.
+    (unsafe { libc::geteuid() } == 0).then_some((65534, 65534))
+}
+
+/// Every path under `root`, `root` included.
+fn walk(root: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![root.to_path_buf()];
+    let mut next = 0;
+    while next < paths.len() {
+        let path = paths[next].clone();
+        next += 1;
+        if fs::symlink_metadata(&path).unwrap().is_dir() {
+            for entry in fs::read_dir(&path).unwrap() {
+                paths.push(entry.unwrap().path());
+            }
+        }
+    }
+    paths
 }
 
 fn listing(dir: &Path) -> Vec<String> {
@@ -510,4 +595,40 @@ fn root_mounts_a_worktree_for_every_process() {
     f.ok(&["worktrees", "mount", &wt, dir.to_str().unwrap()]);
     f.ok(&["worktrees", "delete", &wt]);
     assert!(!dir.join("from-run").exists());
+}
+
+#[test]
+fn through_sudo_worktrees_belong_to_and_run_as_the_user_who_ran_it() {
+    let Some(f) = Fixture::new() else { return };
+    let Some(user) = sudo_user() else { return };
+    let dir = f.home.join("mnt");
+    fs::create_dir(&dir).unwrap();
+    f.give_to(user);
+
+    let wt = succeed(f.sudo(&["worktrees", "create", "base"], user));
+    succeed(f.sudo(&["worktrees", "mount", &wt, dir.to_str().unwrap()], user));
+    succeed(f.sudo(&["worktrees", "unmount", &wt], user));
+    let ids = succeed(f.sudo(
+        &[
+            "worktrees",
+            "run",
+            &wt,
+            "--",
+            "sh",
+            "-c",
+            "mkdir -p made/by/run && echo x > made/by/run/f && id -u && id -g",
+        ],
+        user,
+    ));
+    assert_eq!(ids, format!("{}\n{}", user.0, user.1));
+    for path in walk(&f.store) {
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        assert_eq!((metadata.uid(), metadata.gid()), user, "{}", path.display());
+    }
+
+    succeed(f.as_user(&["snapshots", "create", "--worktree", &wt], user));
+    succeed(f.as_user(&["worktrees", "delete", &wt], user));
+    succeed(f.as_user(&["trash", "empty", "--yes"], user));
+    assert!(f.entries("worktrees").is_empty());
+    assert!(f.entries("trash").is_empty());
 }

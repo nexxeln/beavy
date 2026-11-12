@@ -15,12 +15,14 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
+use rustix::process::Gid;
 use serde::Serialize;
 
+use super::owner::{self, Identity};
 use crate::error::{Error, Next, Reason};
 use crate::sys::{
     ChildResult, IdMaps, STAGE_CHDIR, STAGE_JOIN, STAGE_MAP, STAGE_MOUNT, STAGE_PRIVATE,
-    STAGE_UNSHARE, errno, has_cap_sys_admin, in_child,
+    STAGE_UNSHARE, STAGE_USER, errno, has_cap_sys_admin, in_child,
 };
 
 /// How this process gets the right to mount overlayfs.
@@ -190,8 +192,16 @@ pub(crate) struct Spec {
 }
 
 impl Spec {
-    /// Mount on `target`. Async-signal-safe calls only.
+    /// Mount on `target`. overlayfs works in its layers with the credentials it
+    /// was mounted with, and needs the file capabilities that acting as the
+    /// store's owner set aside, so they're raised again first; the owner's IDs
+    /// stay, so what overlayfs creates belongs to the owner. Async-signal-safe
+    /// calls only.
     fn mount(&self, target: &CString) -> Result<(), (u8, i32)> {
+        let failed = |err: rustix::io::Errno| (STAGE_MOUNT, err.raw_os_error());
+        let mut sets = rustix::thread::capabilities(None).map_err(failed)?;
+        sets.effective = sets.permitted;
+        rustix::thread::set_capabilities(None, sets).map_err(failed)?;
         // SAFETY: every pointer is a NUL-terminated string prepared before fork.
         unsafe {
             if libc::chdir(self.store.as_ptr()) != 0 {
@@ -331,6 +341,8 @@ pub(crate) struct Enter {
     pub cwd: CString,
     /// A descriptor to keep open across exec: the lock that marks the run as live.
     pub keep: RawFd,
+    /// The user the command runs as, with its groups, when it isn't this process's.
+    pub user: Option<(Identity, Vec<Gid>)>,
 }
 
 impl Enter {
@@ -381,6 +393,9 @@ impl Enter {
                 return Err((STAGE_CHDIR, errno()));
             }
         }
+        if let Some((user, groups)) = &self.user {
+            owner::become_user(user, groups).map_err(|err| (STAGE_USER, err))?;
+        }
         Ok(())
     }
 }
@@ -413,6 +428,7 @@ pub(crate) fn unavailable(stage: u8, err: &io::Error, privilege: Privilege, stor
             store_fs.as_deref().unwrap_or("this filesystem")
         ),
         STAGE_JOIN => format!("Can't join the worktree's running command in its namespace: {err}."),
+        STAGE_USER => format!("Can't run the command as the user who ran sudo: {err}."),
         _ => format!("Can't mount worktrees. Preparing the mount failed at step {stage}: {err}."),
     };
     if container && matches!(errno, Some(libc::EPERM | libc::EACCES)) {

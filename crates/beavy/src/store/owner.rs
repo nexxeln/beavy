@@ -67,6 +67,31 @@ pub(crate) fn caller() -> Identity {
     Identity { uid, gid, groups }
 }
 
+/// The user a command beavy runs should run as, when that isn't the process's own:
+/// the one who ran sudo.
+pub(crate) fn command_user() -> Option<Identity> {
+    sudo_caller().map(|(uid, gid)| Identity::of(uid, gid))
+}
+
+/// Become `identity` for good on this thread: groups, then group, then user.
+/// Async-signal-safe, for the step between fork and exec. Fails with the errno.
+pub(crate) fn become_user(identity: &Identity, groups: &[Gid]) -> Result<(), i32> {
+    let gid = Gid::from_raw(identity.gid);
+    let uid = rustix::process::Uid::from_raw(identity.uid);
+    rustix::thread::set_thread_groups(groups).map_err(|err| err.raw_os_error())?;
+    rustix::thread::set_thread_res_gid(gid, gid, gid).map_err(|err| err.raw_os_error())?;
+    rustix::thread::set_thread_res_uid(uid, uid, uid).map_err(|err| err.raw_os_error())
+}
+
+/// `identity`'s groups, ready for [`become_user`].
+pub(crate) fn groups_of(identity: &Identity) -> Vec<Gid> {
+    identity
+        .groups
+        .iter()
+        .map(|gid| Gid::from_raw(*gid))
+        .collect()
+}
+
 /// A user's primary group, from the password database.
 pub(crate) fn primary_gid(uid: u32) -> Option<u32> {
     account(uid).map(|account| account.gid)

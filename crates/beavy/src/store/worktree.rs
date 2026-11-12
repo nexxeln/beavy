@@ -33,7 +33,7 @@ use super::squash::{self, SQUASH_DEPTH};
 use super::trash::Kind;
 use super::{
     FORMAT, Guard, LAYERS, SNAPSHOTS, Store, WORKTREES, crash_point, fs_error, list_dir, lock_file,
-    random_id, read_record, try_lock_file, validate_name, write_record,
+    owner, random_id, read_record, try_lock_file, validate_name, write_record,
 };
 use crate::envelope::Warning;
 use crate::error::{Error, Next, Reason};
@@ -133,6 +133,7 @@ pub struct Prepared {
     store: PathBuf,
     run: File,
     _entering: File,
+    _acting: owner::Acting,
     pub warnings: Vec<Warning>,
 }
 
@@ -174,11 +175,18 @@ impl Prepared {
     fn failure(&self, err: std::io::Error) -> Error {
         let code = err.raw_os_error().unwrap_or(0);
         let (stage, errno) = ((code >> 16) as u8, code & 0xffff);
+        let program = self.program.to_string_lossy();
+        if stage == crate::sys::STAGE_USER {
+            return Error::new(
+                Reason::PermissionDenied,
+                format!("Can't run {program} as the user who ran sudo."),
+            )
+            .with_cause(std::io::Error::from_raw_os_error(errno));
+        }
         if stage != 0 {
             let err = std::io::Error::from_raw_os_error(errno);
             return overlay::unavailable(stage, &err, self.privilege, &self.store);
         }
-        let program = self.program.to_string_lossy();
         match err.kind() {
             ErrorKind::NotFound => Error::new(
                 Reason::NotFound,
@@ -200,6 +208,7 @@ impl Prepared {
 impl Store {
     /// Every worktree, newest first.
     pub fn worktrees(&self) -> Result<Vec<Worktree>, Error> {
+        let _acting = self.act()?;
         let records = self.read_worktrees()?;
         let snapshots = self.read_snapshots()?;
         let table = overlay::mounts(None).unwrap_or_default();
@@ -211,6 +220,7 @@ impl Store {
 
     /// The worktree whose ID or name is `selector`.
     pub fn worktree(&self, selector: &str) -> Result<Worktree, Error> {
+        let _acting = self.act()?;
         let records = self.read_worktrees()?;
         let record = find(&records, selector).ok_or_else(|| self.worktree_not_found(selector))?;
         self.fresh_view(record)
@@ -226,6 +236,7 @@ impl Store {
         if let Some(name) = name {
             validate_name(name)?;
         }
+        let _acting = self.act()?;
         if !self.exists()? {
             return Err(self.snapshot_not_found(snapshot));
         }
@@ -287,6 +298,7 @@ impl Store {
     /// Move a worktree to the trash, unmounting it first. Refused while a command
     /// runs in it.
     pub fn delete_worktree(&self, selector: &str) -> Result<DeletedWorktree, Error> {
+        let _acting = self.act()?;
         if !self.exists()? {
             return Err(self.worktree_not_found(selector));
         }
@@ -315,6 +327,7 @@ impl Store {
 
     /// Mount a worktree at `dir` for every process. Needs root.
     pub fn mount_worktree(&self, selector: &str, dir: &Path) -> Result<Mounted, Error> {
+        let _acting = self.act()?;
         let privilege = Privilege::detect();
         if privilege != Privilege::Root {
             return Err(Error::new(
@@ -389,6 +402,7 @@ impl Store {
 
     /// Unmount a worktree's persistent mount.
     pub fn unmount_worktree(&self, selector: &str) -> Result<Mounted, Error> {
+        let _acting = self.act()?;
         if !self.exists()? {
             return Err(self.worktree_not_found(selector));
         }
@@ -421,6 +435,7 @@ impl Store {
         program: &OsStr,
         args: &[OsString],
     ) -> Result<Prepared, Error> {
+        let acting = self.act()?;
         if !self.exists()? {
             return Err(self.worktree_not_found(selector));
         }
@@ -476,6 +491,10 @@ impl Store {
             target: c_path(&target)?,
             cwd: c_path(&cwd)?,
             keep: run.as_raw_fd(),
+            user: owner::command_user().map(|user| {
+                let groups = owner::groups_of(&user);
+                (user, groups)
+            }),
         };
         let mut command = Command::new(program);
         command.args(args).env(WORKTREE_VARIABLE, &record.id);
@@ -495,6 +514,7 @@ impl Store {
             store: self.path().to_path_buf(),
             run,
             _entering: entering,
+            _acting: acting,
             warnings,
         })
     }
@@ -510,6 +530,7 @@ impl Store {
         if let Some(name) = name {
             validate_name(name)?;
         }
+        let _acting = self.act()?;
         if !self.exists()? {
             return Err(self.worktree_not_found(selector));
         }
@@ -811,8 +832,7 @@ impl Store {
             .map_err(|err| fs_error(err, format!("create {}", path.display())))?;
         if let Some(metadata) = metadata {
             let set = || -> std::io::Result<()> {
-                // SAFETY: geteuid has no preconditions.
-                if unsafe { libc::geteuid() } == 0 {
+                if owner::acting_as_root() {
                     std::os::unix::fs::lchown(path, Some(metadata.uid()), Some(metadata.gid()))?;
                 }
                 fs::set_permissions(path, Permissions::from_mode(metadata.mode() & 0o7777))

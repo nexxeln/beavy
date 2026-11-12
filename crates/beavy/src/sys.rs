@@ -15,6 +15,7 @@ pub(crate) const STAGE_CHDIR: u8 = 3;
 pub(crate) const STAGE_PRIVATE: u8 = 4;
 pub(crate) const STAGE_MOUNT: u8 = 5;
 pub(crate) const STAGE_JOIN: u8 = 6;
+pub(crate) const STAGE_USER: u8 = 7;
 
 pub(crate) fn errno() -> i32 {
     io::Error::last_os_error().raw_os_error().unwrap_or(0)

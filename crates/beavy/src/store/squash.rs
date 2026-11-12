@@ -58,8 +58,7 @@ pub(crate) fn merge(base: &Path, layers: &[PathBuf], dest: &Path) -> Result<(), 
     let failed = |err: io::Error, action: &str, path: &Path| {
         fs_error(err, format!("{action} {}", path.display()))
     };
-    // SAFETY: geteuid has no preconditions.
-    let privileged = unsafe { libc::geteuid() } == 0;
+    let privileged = super::owner::acting_as_root();
     let mut dirs: HashMap<PathBuf, fs::Metadata> = HashMap::new();
     for layer in layers {
         let root = fs::symlink_metadata(layer).map_err(|err| failed(err, "read", layer))?;
