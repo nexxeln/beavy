@@ -369,6 +369,26 @@ fn interrupted_imports_and_deletes_are_repaired() {
 }
 
 #[test]
+fn a_store_is_made_only_in_an_empty_directory() {
+    let f = Fixture::new();
+    let data = f.home.join("data");
+    fs::create_dir_all(data.join("tmp/build-cache")).unwrap();
+    fs::create_dir_all(data.join("layers/photos")).unwrap();
+    let refused = f.output(&[
+        "snapshots",
+        "create",
+        "--store",
+        data.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(refused.status.code(), Some(2));
+    assert_eq!(error(&refused)["reason"], "invalid_arguments");
+    assert!(data.join("tmp/build-cache").is_dir());
+    assert!(data.join("layers/photos").is_dir());
+    assert!(!data.join("store.json").exists());
+}
+
+#[test]
 fn a_symlinked_head_is_never_written_through() {
     let f = Fixture::new();
     f.git(&["init", "-q", "-b", "main"]);

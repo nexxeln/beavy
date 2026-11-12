@@ -402,17 +402,35 @@ impl Store {
         Ok((guard, warnings))
     }
 
+    /// Make the store in a new or empty directory. A directory with anything in it
+    /// is refused: beavy removes what it doesn't recognize from tmp/ and layers/, so
+    /// it never adopts a directory it didn't create.
     fn create(&self) -> Result<(), Error> {
         let shown = self.root.display();
-        if let Some(parent) = self.root.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|err| fs_error(err, format!("create store {shown}")))?;
-        }
-        match fs::DirBuilder::new().mode(0o700).create(&self.root) {
-            Err(err) if err.kind() != ErrorKind::AlreadyExists => {
-                return Err(fs_error(err, format!("create store {shown}")));
+        match fs::read_dir(&self.root) {
+            Ok(mut entries) => {
+                if entries.next().is_some() {
+                    return Err(Error::new(
+                        Reason::InvalidArguments,
+                        format!(
+                            "Can't create a store in {shown}. The directory isn't empty, and it isn't a beavy store."
+                        ),
+                    ));
+                }
             }
-            _ => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                if let Some(parent) = self.root.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|err| fs_error(err, format!("create store {shown}")))?;
+                }
+                match fs::DirBuilder::new().mode(0o700).create(&self.root) {
+                    Err(err) if err.kind() != ErrorKind::AlreadyExists => {
+                        return Err(fs_error(err, format!("create store {shown}")));
+                    }
+                    _ => {}
+                }
+            }
+            Err(err) => return Err(fs_error(err, format!("read {shown}"))),
         }
         for dir in [LAYERS, SNAPSHOTS, TRASH, TMP] {
             let path = self.join(dir);
@@ -463,10 +481,14 @@ impl Store {
     }
 
     /// Remove leftovers of interrupted commands: tmp/ entries no process holds,
-    /// half-written records and trash entries, and layers no snapshot uses.
+    /// half-written records and trash entries, and layers no snapshot uses. Only
+    /// names beavy makes are touched.
     fn repair(&self, guard: &Guard) -> Result<Vec<Warning>, Error> {
         let mut warnings = Vec::new();
         for entry in list_dir(&self.join(TMP))? {
+            if !is_random_id(&entry) {
+                continue;
+            }
             let path = self.join(TMP).join(&entry);
             let Ok(file) = at::open_dir(&path).map(File::from) else {
                 continue;
@@ -478,7 +500,7 @@ impl Store {
             }
         }
         for entry in list_dir(&self.join(SNAPSHOTS))? {
-            if entry.as_bytes().starts_with(b".") {
+            if is_temporary_record(&entry) {
                 let _ = fs::remove_file(self.join(SNAPSHOTS).join(entry));
             }
         }
@@ -502,6 +524,7 @@ impl Store {
         }
         let unused: Vec<OsString> = list_dir(&self.join(LAYERS))?
             .into_iter()
+            .filter(|layer| is_random_id(layer))
             .filter(|layer| !layer.to_str().is_some_and(|layer| used.contains(layer)))
             .collect();
         if unused.is_empty() {
@@ -589,9 +612,34 @@ pub(crate) fn write_record<T: Serialize>(dir: &Path, name: &str, record: &T) -> 
     write().map_err(|err| fs_error(err, format!("write {}", target.display())))
 }
 
+const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
+
+/// Whether `name` has the shape of [`random_id`]: the names of layers and tmp/
+/// entries.
+pub(crate) fn is_random_id(name: impl AsRef<std::ffi::OsStr>) -> bool {
+    let name = name.as_ref().as_bytes();
+    name.len() == 10 && name.iter().all(|b| ALPHABET.contains(b))
+}
+
+/// Whether `id` is `prefix`, an underscore, and a [`random_id`], such as
+/// `snap_0123456789`.
+pub(crate) fn is_id(prefix: &str, id: &str) -> bool {
+    id.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('_'))
+        .is_some_and(is_random_id)
+}
+
+/// A temporary file [`write_record`] left: `.<name>.<random id>`.
+fn is_temporary_record(name: &std::ffi::OsStr) -> bool {
+    let name = name.as_bytes();
+    name.len() > 12
+        && name.starts_with(b".")
+        && name[name.len() - 11] == b'.'
+        && is_random_id(std::ffi::OsStr::from_bytes(&name[name.len() - 10..]))
+}
+
 /// Ten random characters from a lowercase alphabet without look-alikes.
 pub(crate) fn random_id() -> String {
-    const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
     let mut bytes = [0u8; 10];
     let mut filled = 0;
     while filled < bytes.len() {
@@ -819,9 +867,10 @@ mod tests {
         let (guard, warnings) = store.open_for_change().unwrap();
         assert!(warnings.is_empty());
         let kept = store.scratch(&guard).unwrap();
-        fs::create_dir(store.join(TMP).join("stale")).unwrap();
-        fs::create_dir_all(store.join(LAYERS).join("orphan/sub")).unwrap();
-        fs::write(store.join(SNAPSHOTS).join(".x.json.tmp"), b"").unwrap();
+        fs::create_dir(store.join(TMP).join(random_id())).unwrap();
+        fs::create_dir_all(store.join(LAYERS).join(random_id()).join("sub")).unwrap();
+        let temporary = format!(".snap_0123456789.json.{}", random_id());
+        fs::write(store.join(SNAPSHOTS).join(temporary), b"").unwrap();
         drop(guard);
         let (_guard, warnings) = store.open_for_change().unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
@@ -831,5 +880,42 @@ mod tests {
         );
         assert!(list_dir(&store.join(LAYERS)).unwrap().is_empty());
         assert!(list_dir(&store.join(SNAPSHOTS)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_store_is_made_only_in_an_empty_directory_and_repair_keeps_foreign_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        fs::create_dir_all(data.join("tmp/build-cache")).unwrap();
+        fs::create_dir_all(data.join("layers/photos")).unwrap();
+        let err = Store::at(&data).open_for_change().err().unwrap();
+        assert_eq!(err.reason(), Reason::InvalidArguments);
+        assert!(data.join("tmp/build-cache").exists());
+        assert!(data.join("layers/photos").exists());
+
+        let store = Store::at(dir.path().join("store"));
+        drop(store.open_for_change().unwrap());
+        for (dir, name) in [(TMP, "notes"), (LAYERS, "photos"), (TRASH, "keep")] {
+            fs::create_dir(store.join(dir).join(name)).unwrap();
+        }
+        fs::write(store.join(SNAPSHOTS).join(".hidden"), b"").unwrap();
+        drop(store.open_for_change().unwrap());
+        for (dir, name) in [
+            (TMP, "notes"),
+            (LAYERS, "photos"),
+            (TRASH, "keep"),
+            (SNAPSHOTS, ".hidden"),
+        ] {
+            assert!(store.join(dir).join(name).exists(), "{dir}/{name}");
+        }
+        assert!(is_id("snap", "snap_0123456789"));
+        for bad in [
+            "snap_012345678",
+            "snap_../../xx",
+            "wt_0123456789",
+            "snap_ABCDEFGHJK",
+        ] {
+            assert!(!is_id("snap", bad), "{bad}");
+        }
     }
 }

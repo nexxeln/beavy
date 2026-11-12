@@ -198,10 +198,13 @@ The project is the nearest directory at or above `--cwd` that already has a defa
 store, else the root of the Git working tree around it, else `--cwd` itself. Every
 suggested command repeats the `--cwd` and `--store` the caller passed.
 
-Reads never create a store; the first change does. Every change takes the store's
-lock and first repairs whatever an interrupted command left behind, so a killed
-command never leaves a half-made snapshot in view. A store records its
-layout version, and a beavy that can't read it fails with `invalid_store`.
+Reads never create a store; the first change does, in a directory that doesn't
+exist or is empty. A directory with anything else in it fails with
+`invalid_arguments`, so beavy never adopts, or cleans up, files it didn't make.
+Every change takes the store's lock and first repairs whatever an interrupted
+command left behind, so a killed command never leaves a half-made snapshot in
+view. Repair only touches names beavy makes. A store records its layout version,
+and a beavy that can't read it fails with `invalid_store`.
 
 A store belongs to the user who created it, and every file beavy reads or writes
 in a store, it reads or writes as that user:

@@ -8,7 +8,9 @@ use std::io::ErrorKind;
 use serde::{Deserialize, Serialize};
 
 use super::snapshot::SnapshotRecord;
-use super::{FORMAT, SNAPSHOTS, Store, TRASH, fs_error, list_dir, read_record, write_record};
+use super::{
+    FORMAT, SNAPSHOTS, Store, TRASH, fs_error, is_id, list_dir, read_record, write_record,
+};
 use crate::envelope::Warning;
 use crate::error::{Error, Reason};
 use crate::time;
@@ -35,6 +37,21 @@ impl Kind {
             Kind::Snapshot => SNAPSHOT_FILE,
         }
     }
+
+    const ALL: [Kind; 1] = [Kind::Snapshot];
+
+    /// What the IDs of this kind start with.
+    const fn prefix(self) -> &'static str {
+        match self {
+            Kind::Snapshot => "snap",
+        }
+    }
+}
+
+/// Whether `name` could be a trash entry: the ID of something the trash holds.
+fn is_entry(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| Kind::ALL.iter().any(|kind| is_id(kind.prefix(), name)))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,6 +215,9 @@ impl Store {
     pub(crate) fn trashed_snapshots(&self) -> Result<Vec<SnapshotRecord>, Error> {
         let mut records = Vec::new();
         for entry in list_dir(&self.join(TRASH))? {
+            if !is_entry(&entry) {
+                continue;
+            }
             let path = self.join(TRASH).join(&entry).join(SNAPSHOT_FILE);
             if let Some(record) = read_record::<SnapshotRecord>(&path)? {
                 records.push(record);
@@ -211,6 +231,9 @@ impl Store {
     fn trash_records(&self) -> Result<Vec<EntryRecord>, Error> {
         let mut records = Vec::new();
         for entry in list_dir(&self.join(TRASH))? {
+            if !is_entry(&entry) {
+                continue;
+            }
             let dir = self.join(TRASH).join(&entry);
             let Some(record) = read_record::<EntryRecord>(&dir.join(ENTRY_FILE))? else {
                 continue;
@@ -231,6 +254,9 @@ impl Store {
     pub(crate) fn repair_trash(&self) -> Result<Vec<Warning>, Error> {
         let mut warnings = Vec::new();
         for entry in list_dir(&self.join(TRASH))? {
+            if !is_entry(&entry) {
+                continue;
+            }
             let dir = self.join(TRASH).join(&entry);
             let complete = read_record::<EntryRecord>(&dir.join(ENTRY_FILE))
                 .ok()
