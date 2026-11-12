@@ -89,8 +89,10 @@ mounted over the project's real path, in a mount namespace of its own:
    mounts the host makes later still reach it.
 2. It mounts the worktree's stack over the directory the snapshot was imported
    from, then changes into the caller's directory again, so the working directory
-   resolves through the new mount.
-3. It replaces itself with the command (`execve`).
+   resolves through the new mount. When the worktree doesn't have that directory,
+   because a command deleted it there, the command starts at the project's root.
+3. It replaces itself with the command (`execve`), as the caller (see
+   [Who beavy acts as](#who-beavy-acts-as)).
 
 Because beavy becomes the command, the command keeps beavy's process ID, standard
 streams, terminal, and signals, and its exit status is the caller's. Ctrl+C,
@@ -105,9 +107,16 @@ own view.
 
 Commands in the same worktree can run at once. Mounting the same upper layer twice
 is undefined in overlayfs, so beavy never does: the first command mounts it, and
-each later one joins the first one's namespaces with `setns` and sees the same
-mount. Each running command holds a lock on its own file in `runs/`, inherited
-across `exec`, which is how beavy knows a worktree is in use.
+each later one joins, with `setns`, the namespaces of a process that still has it
+mounted, and sees the same mount. Each running command holds a lock on its own
+file in `runs/`, inherited across `exec`. That lock isn't enough to know a
+worktree is in use: a background job can outlive the command that started it, and
+anything that closes inherited descriptors, such as Python's `subprocess`, drops
+the lock while it keeps running. So beavy also looks for the worktree's mount in
+the mount table of every process it can see (`/proc/<pid>/mountinfo`). A later run
+joins any of them, and sealing, unmounting, and deleting are refused, naming the
+processes, while any of them is left. A sealed layer can't be written to by a
+process that was still in the worktree, because no such process is left.
 
 As root, `beavy worktrees mount <WORKTREE> <DIR>` also mounts a worktree for every
 process, at a directory you choose. Commands started with `run` then bind that
@@ -125,6 +134,37 @@ so a command sees its real UID and GID and the files it creates belong to the
 caller. Files owned by users outside the mapping appear as `nobody`; a project
 the caller owns is unaffected.
 
+### Who beavy acts as
+
+beavy does all its file work in a store as the store's owner, and keeps root only
+for what needs it: mounting, unmounting, and joining namespaces.
+
+- **Through sudo**, beavy works for the user who ran it (`SUDO_UID`). It uses only
+  stores that user owns, reads and writes them as that user, and runs the command
+  in `worktrees run` as that user, with their groups, because commands run as the
+  caller. Everything in the store and the worktree stays theirs, so they can carry
+  on without sudo.
+- **A root login**, with no user behind sudo, stays root: commands run as root.
+  beavy still works in a store as its owner, so in another user's store it works
+  as that user.
+- **On the thread doing the work**, beavy takes on the owner's file system identity
+  (`setfsuid`, `setfsgid`, and the owner's groups), so every open, create, and
+  rename is checked as the owner. A store must belong to that user and be writable
+  by no one else.
+- **Mounts** take their directories as descriptors. beavy opens each layer, the
+  upper and work directories, and the directory it mounts on without following a
+  symlink, beneath the store's directory, and passes them as `/proc/self/fd/<n>`
+  paths. A process that has entered a new mount namespace opens each one again
+  and refuses it unless it's the same inode, since overlayfs takes layers only
+  from the mounting process's namespace. Nothing a store's owner renames or swaps
+  can redirect a mount. overlayfs works in its layers with the credentials it was
+  mounted with: beavy mounts with the owner's IDs and root's capabilities, so
+  what overlayfs creates belongs to the owner. Every mount is `nosuid,nodev`.
+- **Where a worktree goes.** `worktrees mount` refuses a directory inside the
+  store or one the store is inside, which would hide it. Through sudo, it mounts
+  only on a directory the user owns, and `worktrees run` only over a project
+  directory the user owns.
+
 Both modes mount with the same options:
 
 - **`userxattr`, always.** overlayfs records whiteouts, opaque directories, and
@@ -140,8 +180,7 @@ Both modes mount with the same options:
 - **Never `volatile`.** A worktree's upper layer is real data that must survive a
   crash.
 - **Short layer paths.** The kernel caps mount options at one page on most
-  versions. beavy mounts from the store's root with relative paths
-  (`layers/abc123`), about 17 bytes per layer.
+  versions. Each layer is a `/proc/self/fd/<n>` path, about 17 bytes.
 
 ## Squashing
 
@@ -154,7 +193,11 @@ rewritten.
 Layers never change, so the merged layer hard-links regular files from the layers
 it merges instead of copying them. A squash costs one link per changed file, not a
 copy per byte, and the result shows exactly what the stack showed: whiteouts and
-opaque directories are kept wherever they hide something in the base.
+opaque directories are kept wherever they hide something in the base. A file the
+owner may not link, such as one owned by another user under
+`fs.protected_hardlinks`, is copied instead. The store lock is released while
+layers merge, so the rest of the store carries on; the worktree's own lock keeps
+everything else off the worktree being sealed.
 
 Measured on the n8n tree from the [benchmark](#benchmark), with chains of sealed
 layers built without squashing. Each layer holds an edit plus an incremental
@@ -191,7 +234,9 @@ tell, the exact command that fixes it.
 | Kernel without overlayfs | `backend_unavailable`. beavy never loads modules |
 | macOS and other platforms | `backend_unavailable` from every snapshot, worktree, and trash command |
 | The project directory was moved or deleted | `not_found` from `run`: a worktree runs at the path its snapshot was imported from |
-| A command in the worktree is still running | `worktree_in_use` from seal, mount, unmount, and delete, naming the processes |
+| A command in the worktree, or a process it started, is still running | `worktree_in_use` from seal, mount, unmount, and delete, naming the processes. A later `run` joins them |
+| The store belongs to another user, or others can write to it | `permission_denied`, with `chmod go-w` when others can write |
+| A record or seal journal in the store fails beavy's checks | `invalid_store`; beavy never uses an ID from it as a path |
 | beavy is killed mid-command | The next change to the store repairs it; nothing half-made is ever listed |
 
 `beavy worktrees create` mounts every new worktree once in a throwaway namespace
@@ -201,10 +246,10 @@ changing anything.
 
 Some limits are inherent to overlayfs. Copying up a file that was hard-linked in a
 lower layer gives the worktree its own copy, so hard links don't span the boundary.
-A command that closes every inherited file descriptor drops its run lock, and beavy
-then treats the worktree as idle while it still runs. Renaming a directory that
-exists in a lower layer fails with `EXDEV`, which `mv` and most tools handle by
-copying.
+Renaming a directory that exists in a lower layer fails with `EXDEV`, which `mv`
+and most tools handle by copying. beavy finds processes in a worktree through the
+mount tables it can read; as a user that's the user's own processes, which is
+everything a command run as that user can start.
 
 ## Compared with rift
 
@@ -265,7 +310,7 @@ Inside against outside, cold means after dropping the page cache:
 | Tests, `vitest run test/expression` in `packages/workflow`, warm | 24.4–24.8 s | 24.7–25.2 s | 25.0–25.4 s |
 | Stat of every entry, cold / again in a new run | 3.69 / 1.54 s | 6.51 / 3.94 s | 6.39 / 4.06 s |
 | Stat of every entry, repeated within one run | 1.30–1.42 s | 1.75 s | |
-| `git status`, first / later | 0.27 / 0.15 s | 4.00 / 0.32 s | 4.28 / 0.36 s |
+| `git status`, first / later, before imports refreshed the index | 0.27 / 0.15 s | 4.00 / 0.32 s | 4.28 / 0.36 s |
 
 Typecheck and tests, the work agents spend their time on, run within about 3% of
 the original tree in a user namespace, and within about 10% as root. Two costs are
@@ -276,10 +321,14 @@ real:
   run costs about 2.5 times the original tree's, even with the page cache warm.
   Repeated walks within one run cost about 25% more, the same as the earlier
   experiment measured (1.69 against 1.26 s).
-- **The first `git status` in a new worktree reads every tracked file.** The
-  copy's inode numbers and change times don't match what Git's index recorded, so
-  Git rehashes everything once, then writes the refreshed index into the worktree.
-  Later runs, and worktrees of snapshots sealed after that, are fast.
+- **Git's index has to be refreshed once per import.** The copy's inode numbers
+  and change times don't match what Git's index recorded, so Git would rehash
+  every tracked file the first time it runs in each new worktree. The import runs
+  `git update-index --refresh` in the copy instead, which took 1.1 s on this tree.
+  Measured later on the same machine in a user namespace, over 9 new worktrees
+  each, the first `git status` took 1.6 to 3.5 s (median 1.8 s) without the
+  refresh and 0.39 to 0.51 s (median 0.45 s) with it, the same as later runs
+  (0.37 to 0.48 s).
 
 Against the earlier experiment, which mounted overlayfs by hand on the same tree:
 create was 22 ms there and 21 ms here, extra disk 0 there and 4 KB here (the
@@ -300,7 +349,5 @@ and a remount, against 9 ms here.
   nothing else about Git; moving work out of a worktree is up to Git or the agent.
 - **Keeping a worktree's mount alive between runs**, so overlayfs's cache stays
   warm. It needs a process to hold the namespace open, which beavy avoids.
-- **Refreshing Git's index at import**, which would make the first `git status`
-  in a new worktree as fast as later ones. It means running Git during the import.
 - **Refreshing a running worktree's base.** A new import is a new snapshot, and
   existing worktrees keep the snapshot they started from.
