@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 248 56" width="248" height="56" role="img" aria-label="beavy">
+  <title>beavy</title>
+  <path fill="#12110F" d="M48 6h8v4h-8zM28 10h16v4h-16zM48 10h20v4h-20zM24 14h44v4h-44zM20 18h32v4h-32zM56 18h16v4h-16zM20 22h52v4h-52zM4 26h64v4h-64zM24 30h40v4h-40zM24 34h36v4h-36zM64 34h4v4h-4zM4 38h16v4h-16zM24 38h8v4h-8zM40 38h8v4h-8zM56 38h8v4h-8z"/>
+  <path fill="#E8590C" d="M0 30h24v4h-24zM0 34h24v4h-24z"/>
+  <g fill="none" stroke="#12110F" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M90 4V40M90 28a12 12 0 1 0 24 0a12 12 0 1 0 -24 0M123 28H147A12 12 0 1 0 144.19 35.71M156 28a12 12 0 1 0 24 0a12 12 0 1 0 -24 0M180 16V40M190 16L202 40L214 16M222 16L234 40M246 16L228 52"/>
+  </g>
+</svg>

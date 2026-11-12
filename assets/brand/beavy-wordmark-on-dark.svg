@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 56" width="160" height="56" role="img" aria-label="beavy">
+  <title>beavy</title>
+  <g fill="none" stroke="#F1ECE2" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M2 4V40M2 28a12 12 0 1 0 24 0a12 12 0 1 0 -24 0M35 28H59A12 12 0 1 0 56.19 35.71M68 28a12 12 0 1 0 24 0a12 12 0 1 0 -24 0M92 16V40M102 16L114 40L126 16M134 16L146 40M158 16L140 52"/>
+  </g>
+</svg>
