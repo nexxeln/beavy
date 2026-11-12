@@ -35,6 +35,30 @@ pub(crate) fn privileged() -> bool {
     rustix::process::geteuid().is_root()
 }
 
+/// The user this thread acts as, when beavy is root acting as another user.
+pub(crate) fn acting_uid() -> Option<u32> {
+    // SAFETY: setfsuid with an invalid ID changes nothing and returns the current one.
+    let uid = unsafe { libc::setfsuid(u32::MAX) } as u32;
+    (privileged() && uid != 0).then_some(uid)
+}
+
+/// The user this thread acts as, with its groups, when beavy is root acting as
+/// another user.
+pub(crate) fn acting() -> Option<Identity> {
+    let uid = acting_uid()?;
+    // SAFETY: setfsgid with an invalid ID changes nothing and returns the current one.
+    let gid = unsafe { libc::setfsgid(u32::MAX) } as u32;
+    let groups = rustix::process::getgroups()
+        .map(|groups| groups.iter().map(|gid| gid.as_raw()).collect())
+        .unwrap_or_else(|_| vec![gid]);
+    Some(Identity { uid, gid, groups })
+}
+
+/// A user's home directory, from the password database.
+pub(crate) fn home_of(uid: u32) -> Option<PathBuf> {
+    account(uid).map(|account| account.home)
+}
+
 /// Whether file access on this thread is root's: beavy is root and isn't acting as
 /// another user.
 pub(crate) fn acting_as_root() -> bool {
@@ -65,6 +89,31 @@ pub(crate) fn caller() -> Identity {
         .map(|groups| groups.iter().map(|gid| gid.as_raw()).collect())
         .unwrap_or_else(|_| vec![gid]);
     Identity { uid, gid, groups }
+}
+
+/// The user a command beavy runs should run as, when that isn't the process's own:
+/// the one who ran sudo.
+pub(crate) fn command_user() -> Option<Identity> {
+    sudo_caller().map(|(uid, gid)| Identity::of(uid, gid))
+}
+
+/// Become `identity` for good on this thread: groups, then group, then user.
+/// Async-signal-safe, for the step between fork and exec. Fails with the errno.
+pub(crate) fn become_user(identity: &Identity, groups: &[Gid]) -> Result<(), i32> {
+    let gid = Gid::from_raw(identity.gid);
+    let uid = rustix::process::Uid::from_raw(identity.uid);
+    rustix::thread::set_thread_groups(groups).map_err(|err| err.raw_os_error())?;
+    rustix::thread::set_thread_res_gid(gid, gid, gid).map_err(|err| err.raw_os_error())?;
+    rustix::thread::set_thread_res_uid(uid, uid, uid).map_err(|err| err.raw_os_error())
+}
+
+/// `identity`'s groups, ready for [`become_user`].
+pub(crate) fn groups_of(identity: &Identity) -> Vec<Gid> {
+    identity
+        .groups
+        .iter()
+        .map(|gid| Gid::from_raw(*gid))
+        .collect()
 }
 
 /// A user's primary group, from the password database.

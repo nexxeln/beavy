@@ -277,14 +277,14 @@ fn help_works_everywhere_with_no_environment() {
         assert_eq!(run.stdout, expected, "{args:?}");
     }
     let root = run(&[]).stdout;
-    assert!(root.contains("Snapshots:\n  snapshots  Create, inspect, and delete snapshots"));
+    assert!(root.contains("Worktrees:\n  worktrees  Create worktrees of a snapshot"));
     assert!(root.contains("Machine:\n  host       Inspect this machine"));
 }
 
 #[cfg(not(target_os = "linux"))]
 #[test]
-fn snapshots_and_trash_report_the_backend_unavailable() {
-    for group in ["snapshots", "trash"] {
+fn snapshots_worktrees_and_trash_report_the_backend_unavailable() {
+    for group in ["snapshots", "worktrees", "trash"] {
         let run = run(&[group, "list", "--json"]);
         assert_eq!(run.code, 1, "{group}");
         assert_eq!(run.stdout, "");

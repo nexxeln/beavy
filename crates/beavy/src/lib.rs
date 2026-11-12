@@ -15,6 +15,8 @@ pub mod outcome;
 pub mod output;
 #[cfg(target_os = "linux")]
 pub mod store;
+#[cfg(target_os = "linux")]
+mod sys;
 pub mod time;
 
 pub use envelope::{Document, SCHEMA_VERSION, Warning, WarningReason};

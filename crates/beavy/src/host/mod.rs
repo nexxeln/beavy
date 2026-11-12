@@ -16,7 +16,7 @@ use crate::envelope::{Warning, WarningReason};
 use crate::error::{Error, Reason};
 
 #[cfg(target_os = "linux")]
-mod linux;
+pub(crate) mod linux;
 #[cfg(target_os = "linux")]
 use linux as platform;
 #[cfg(target_os = "macos")]

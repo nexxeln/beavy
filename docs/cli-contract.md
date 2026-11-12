@@ -60,6 +60,10 @@ The error's reason fixes its class and the class fixes the exit code, so the exi
 code is the source of truth even when output is lost. beavy doesn't install signal
 handlers yet, so 130 and 128 + n come from the default signal disposition.
 
+`beavy worktrees run` is the exception: once its command starts, beavy has replaced
+itself with the command, so the exit status, or the signal that ended it, is the
+command's own. Only a failure before the command starts follows this table.
+
 ## JSON results
 
 Every `--json` document carries `schemaVersion`, the version of the envelope and of
@@ -115,14 +119,15 @@ On failure with `--json`, stderr gets one line:
 | `unknown_command` | Usage | 2 | `error` | A command path segment doesn't exist |
 | `missing_argument` | Missing input | 2 | `action_required` | Required input is missing and the run can't prompt for it |
 | `confirmation_required` | Missing input | 2 | `action_required` | A command that destroys data needs `--yes` in a non-interactive run |
-| `not_found` | Not found | 1 | `error` | A named file, directory, snapshot, or trash entry doesn't exist |
+| `not_found` | Not found | 1 | `error` | A named file, directory, snapshot, worktree, trash entry, or command doesn't exist |
 | `permission_denied` | Permission | 1 | `error` | The process isn't allowed to read or change what was named, or beavy won't use the store: it belongs to another user, other users can write to it, or, as root, another user could replace it |
-| `name_taken` | Conflict | 1 | `error` | Another snapshot in the store has the name |
-| `snapshot_in_use` | Conflict | 1 | `error` | A snapshot can't be deleted while another snapshot was made from it |
+| `name_taken` | Conflict | 1 | `error` | Another snapshot or worktree in the store has the name |
+| `snapshot_in_use` | Conflict | 1 | `error` | A snapshot can't be deleted while another snapshot was made from it or a worktree uses it |
+| `worktree_in_use` | Conflict | 1 | `error` | A worktree can't be sealed, mounted, unmounted, or deleted while commands run in it, processes they started still have it mounted, or files are open in its mount. The message names the processes |
 | `unsupported_git_state` | Conflict | 1 | `error` | The project is a linked Git worktree or submodule, or its repository is in the middle of a merge, rebase, cherry-pick, revert, or bisect |
 | `io_error` | System | 1 | `error` | The operating system failed a read or write |
 | `invalid_store` | System | 1 | `error` | The store has a layout version this beavy can't read, or a damaged record, such as one whose ID isn't an ID |
-| `backend_unavailable` | System | 1 | `error` | This platform can't keep snapshots yet: beavy's store only runs on Linux |
+| `backend_unavailable` | System | 1 | `error` | This machine can't mount worktrees: no overlayfs, neither root nor user namespaces, or a platform other than Linux. `next` names the fix when beavy can tell it |
 | `internal_error` | Internal | 1 | `error` | A bug in beavy |
 | `canceled` | Canceled | 130 | `error` | The user declined a confirmation; nothing changed |
 
@@ -135,6 +140,8 @@ to `error::Reason` in the same change.
 | --- | --- |
 | `cleanup_failed` | A temporary file or directory beavy created couldn't be removed. The message names the path |
 | `entries_skipped` | An import left out entries it can't copy: sockets and device nodes. The message names them |
+| `store_on_overlayfs` | The store is on overlayfs, such as a container's root filesystem. Worktrees stack another overlay on it, which some kernels refuse and every kernel slows down |
+| `remount_failed` | A sealed worktree couldn't be mounted again at the directory it was mounted on before |
 
 ## Human output
 
@@ -177,15 +184,16 @@ Not built yet: machine-readable help (`--help --json`), `help search`, and
 | --- | --- |
 | `BEAVY_STORE` | The store directory when `--store` isn't given. Empty counts as unset |
 | `XDG_DATA_HOME`, `HOME` | Where default stores live (see [Stores](#stores)) |
+| `BEAVY_WORKTREE` | Set by beavy for a command started with `beavy worktrees run`: the worktree's ID |
 | `NO_COLOR`, `FORCE_COLOR`, `TERM`, `CI`, agent variables | See [Modes](#modes) |
 
 ## Stores
 
-Snapshots live in a store: an ordinary directory that beavy creates
+Snapshots and worktrees live in a store: an ordinary directory that beavy creates
 on first use and never writes outside of. Deleting a project's store removes every
 trace of beavy from it.
 
-A `snapshots` or `trash` command picks its store in this order:
+A `snapshots`, `worktrees`, or `trash` command picks its store in this order:
 
 1. `--store <DIR>`.
 2. `BEAVY_STORE`.
@@ -202,8 +210,8 @@ Reads never create a store; the first change does, in a directory that doesn't
 exist or is empty. A directory with anything else in it fails with
 `invalid_arguments`, so beavy never adopts, or cleans up, files it didn't make.
 Every change takes the store's lock and first repairs whatever an interrupted
-command left behind, so a killed command never leaves a half-made snapshot in
-view. Repair only touches names beavy makes. A store records its layout version,
+command left behind, so a killed command never leaves a half-made snapshot or
+worktree in view. Repair only touches names beavy makes. A store records its layout version,
 and a beavy that can't read it fails with `invalid_store`. beavy checks every
 record before using an ID or layer name from it as part of a path, and a record
 that fails the check fails the command with `invalid_store`. Layer data is on
@@ -227,7 +235,8 @@ in a store, it reads or writes as that user:
 
 beavy refuses a store that users other than its owner can write, with
 `permission_denied` and a next command that removes their write access.
-Snapshots need Linux; on other platforms these commands fail with
+
+Snapshots and worktrees need Linux; on other platforms these commands fail with
 `backend_unavailable`.
 
 ## Commands
@@ -307,13 +316,13 @@ on stdout.
 
 ### beavy snapshots create
 
-Import the project into the store as a new snapshot.
+Import the project into the store as a new snapshot, or seal a worktree into one.
 
 ```
-beavy snapshots create [--name <NAME>] [--store <DIR>] [--json]
+beavy snapshots create [--name <NAME>] [--worktree <WORKTREE>] [--store <DIR>] [--json]
 ```
 
-The command copies the project into the store once. It clones
+Without `--worktree`, the command copies the project into the store once. It clones
 files with `FICLONE` when the filesystem supports reflinks and copies them
 otherwise. It keeps modes, times, symlinks, FIFOs, and hard links, and ownership
 only when it works as root. It never reads or writes through a symlink, and each
@@ -321,19 +330,33 @@ file keeps the owner and mode of the file it actually read. It skips sockets and
 device nodes with an `entries_skipped` warning.
 The project itself is only read, and never becomes part of a mount. In the copy,
 Git's HEAD is detached at the current commit, with the index and working tree as
-they were. A linked Git worktree or submodule fails with `unsupported_git_state`
-and a next command for the main working tree. A repository in the middle of a
+they were. When git is installed and the repository belongs to the user beavy
+works as, beavy runs `git update-index --refresh` in the copy as that user, so the
+index's file stats match the copied files and the first git command in a worktree
+doesn't read every file again. A linked Git worktree or submodule fails with
+`unsupported_git_state` and a next command for the main working tree. A repository in the middle of a
 merge, rebase, cherry-pick, revert, or bisect, or locked by a running git, fails
 the same way.
+
+With `--worktree`, the worktree's upper layer becomes the new snapshot's top layer
+without a copy, and the worktree continues from the new snapshot with an empty
+upper layer, so what it shows doesn't change. If the chain would be deeper than 8
+layers, beavy merges every layer above the base into one first (see
+[the design](design/worktrees.md#squashing)). A persistent mount is unmounted for
+the seal and mounted again afterwards; failing that is a `remount_failed` warning.
+Sealing fails with `worktree_in_use` while commands run in the worktree or
+processes they started still have it mounted, and names them. A record or seal
+journal that fails beavy's checks fails the command with `invalid_store`.
 
 A name is 1 to 63 lowercase letters, digits, and hyphens, starting and ending with a
 letter or digit, and unique among the store's snapshots (`name_taken`). The
 snapshot ID prints alone on stdout; everything else goes to stderr.
 
-Result:
+Result of an import, then of a seal:
 
 ```json
 { "schemaVersion": 1, "snapshot": { "...": "..." }, "outcome": "created", "import": { "files": 388848, "bytes": 3812664320 }, "store": { "path": "/home/me/.local/share/beavy/stores/acme-3f9a1c2e" } }
+{ "schemaVersion": 1, "snapshot": { "...": "..." }, "outcome": "created", "worktree": { "...": "..." }, "squashed": false, "store": { "path": "..." } }
 ```
 
 A snapshot object:
@@ -342,10 +365,11 @@ A snapshot object:
 | --- | --- | --- |
 | `id` | string | `snap_` and 10 characters |
 | `name` | string or null | |
-| `parent` | string or null | The snapshot this one was made from; null for an import |
-| `source` | string | The directory the chain's base was imported from |
+| `parent` | string or null | The snapshot a sealed one was made from; null for an import |
+| `source` | string | The directory the chain's base was imported from. Worktrees run there |
 | `commit` | string or null | The Git commit checked out when the snapshot was taken |
-| `method` | `"copy"` or `"reflink"` | How the top layer was made |
+| `method` | `"copy"`, `"reflink"`, or `"seal"` | How the top layer was made |
+| `worktree` | string or null | The worktree a sealed snapshot came from |
 | `depth` | integer | Layers in the chain, the base included |
 | `createdAt` | string | RFC 3339 UTC time |
 | `children` | array of strings | Snapshots whose parent is this one |
@@ -376,7 +400,7 @@ beavy snapshots delete <SNAPSHOT> [--store <DIR>] [--json]
 
 Moves the snapshot to the trash; its data stays on disk until
 `beavy trash empty`. Fails with `snapshot_in_use` while another snapshot was made
-from it. Result: `{ "snapshot": <snapshot>, "outcome": "deleted", "store": { "path": "..." } }`,
+from it or a worktree uses it. Result: `{ "snapshot": <snapshot>, "outcome": "deleted", "store": { "path": "..." } }`,
 with next commands to list snapshots and to restore this one.
 
 ### beavy trash list
@@ -386,7 +410,7 @@ beavy trash list [--store <DIR>] [--json]
 ```
 
 Result: `{ "entries": [{ "id": "...", "kind": "snapshot", "name": null, "deletedAt": "..." }], "store": { "path": "..." } }`,
-most recently deleted first. `kind` is `"snapshot"`.
+most recently deleted first. `kind` is `"snapshot"` or `"worktree"`.
 
 ### beavy trash restore
 
@@ -394,8 +418,10 @@ most recently deleted first. `kind` is `"snapshot"`.
 beavy trash restore <ID> [--store <DIR>] [--json]
 ```
 
-Puts a deleted snapshot back under its old ID. Fails with `name_taken` when a live
-snapshot has its name now. Result: `{ "entry": <entry>, "outcome": "restored", "store": { "path": "..." } }`.
+Puts a deleted snapshot or worktree back under its old ID. Fails with `name_taken`
+when something live has its name now, and a worktree whose snapshot isn't live fails
+with `not_found`, naming the command that restores the snapshot when it's in the
+trash. Result: `{ "entry": <entry>, "outcome": "restored", "store": { "path": "..." } }`.
 
 ### beavy trash empty
 
@@ -411,6 +437,120 @@ non-interactive run needs `--yes`, and without it fails with
 `confirmation_required` (exit 2) and a next command whose `when` says to run it
 only after a human approves. Result: `{ "entries": [<entry>], "outcome": "emptied", "store": { "path": "..." } }`,
 or `"outcome": "unchanged"` when the trash was already empty.
+
+### beavy worktrees create
+
+```
+beavy worktrees create <SNAPSHOT> [--name <NAME>] [--store <DIR>] [--json]
+```
+
+Creates a worktree: the snapshot plus an empty upper layer that will hold the
+worktree's changes. Nothing is copied. Before recording it, beavy mounts the new
+worktree once in a throwaway mount namespace, so a machine that can't run
+worktrees fails here with `backend_unavailable` and the fix in `next` when beavy
+can identify it (such as the Ubuntu sysctl that allows user namespaces). A store
+on overlayfs gets a `store_on_overlayfs` warning. The worktree ID prints alone on
+stdout.
+
+Result: `{ "worktree": <worktree>, "outcome": "created", "backend": <backend>, "store": { "path": "..." } }`.
+
+A worktree object:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `id` | string | `wt_` and 10 characters |
+| `name` | string or null | Unique among the store's worktrees |
+| `snapshot` | string | The snapshot under the worktree's changes: the one it was created from, or last sealed into |
+| `path` | string | The directory the worktree covers while a command runs in it: its snapshot's `source` |
+| `mounts` | array of strings | Directories where it's mounted for every process |
+| `runs` | array of integers | Process IDs of commands running in it, and of processes they started that still have it mounted |
+| `createdAt` | string | RFC 3339 UTC time |
+
+A backend object is `{ "name": "overlayfs", "privilege": "root" }` or
+`"privilege": "userns"`: how this invocation mounts, as root or in an unprivileged
+user namespace.
+
+### beavy worktrees list
+
+```
+beavy worktrees list [--store <DIR>] [--json]
+```
+
+Result: `{ "worktrees": [<worktree>], "backend": <backend>, "store": { "path": "..." } }`,
+newest first. Human output is a table of ID, Name, Snapshot, Mount, Runs, and
+Created on stdout.
+
+### beavy worktrees inspect
+
+```
+beavy worktrees inspect <WORKTREE> [--store <DIR>] [--json]
+```
+
+Result: `{ "worktree": <worktree>, "backend": <backend>, "store": { "path": "..." } }`.
+
+### beavy worktrees run
+
+```
+beavy worktrees run <WORKTREE> [--store <DIR>] -- <COMMAND> [ARG]...
+```
+
+Runs a command in the worktree. The command gets its own mount namespace with the
+worktree mounted over the worktree's `path`, so it sees the project at its usual
+path while nothing outside it sees the worktree. It starts in the current
+directory when that's inside `path` and the worktree has it, and in `path`
+otherwise, with `BEAVY_WORKTREE` set. The mount has no setuid or device files
+(`nosuid,nodev`).
+
+beavy enters the namespace and then replaces itself with the command, so the
+command keeps beavy's process ID, stdin, stdout, stderr, and signals, runs as the
+caller's own user and group, and its exit status is beavy's. Through `sudo`, the
+caller is the user who ran sudo: the command runs as that user, with their groups,
+and `path` must belong to them (`permission_denied` otherwise); a root login runs
+commands as root. beavy writes nothing once the command starts, even with
+`--json`. Failures before it starts follow the contract: `not_found` for an
+unknown worktree or command, `backend_unavailable` when the mount fails,
+`permission_denied` when the command can't run as the user who ran sudo.
+
+Commands in one worktree may run at the same time. The first mounts the worktree
+and later ones join the mount namespace of a process that has it mounted: a
+command still running in it, or one it started in the background. A worktree is
+never mounted twice. A worktree with a persistent mount is bound from that mount.
+
+### beavy worktrees mount
+
+```
+beavy worktrees mount <WORKTREE> <DIR> [--store <DIR>] [--json]
+```
+
+Mounts the worktree on `<DIR>` for every process. Needs root; without it, the
+command fails with `permission_denied` and suggests `beavy worktrees run`. A
+worktree has one mount at a time, and mounting fails with `worktree_in_use` while
+commands run in it. A `<DIR>` inside the store, or one the store is inside, fails
+with `invalid_arguments`; through `sudo`, a `<DIR>` the user who ran sudo
+doesn't own fails with `permission_denied`. Result: `{ "worktree": <worktree>, "outcome": "mounted", "backend": <backend>, "store": { "path": "..." } }`,
+or `"outcome": "unchanged"` when it's already mounted there.
+
+### beavy worktrees unmount
+
+```
+beavy worktrees unmount <WORKTREE> [--store <DIR>] [--json]
+```
+
+Result: `{ "worktree": <worktree>, "outcome": "unmounted", ... }`, or
+`"unchanged"` when it wasn't mounted. Open files under the mount fail it with
+`worktree_in_use` and a `fuser` command that lists the processes.
+
+### beavy worktrees delete
+
+```
+beavy worktrees delete <WORKTREE> [--store <DIR>] [--json]
+```
+
+Unmounts the worktree if it's mounted and moves it to the trash in one rename,
+whatever its size; `beavy trash restore` brings it back until the trash is emptied.
+Fails with `worktree_in_use` while commands run in it or processes they started
+still have it mounted. Result:
+`{ "worktree": <worktree>, "outcome": "deleted", "store": { "path": "..." } }`.
 
 ## Changing the contract
 

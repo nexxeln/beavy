@@ -1,13 +1,15 @@
-//! The store: an ordinary directory that holds one project's immutable layers
-//! and snapshot records. beavy changes nothing outside it, so removing beavy from
-//! a project means deleting its store.
+//! The store: an ordinary directory that holds one project's immutable layers,
+//! snapshot records, and worktrees. beavy changes nothing outside it, so removing
+//! beavy from a project means deleting its store.
 //!
 //! ```text
 //! store.json            format marker
 //! lock                  held briefly by every change to the store's records
 //! layers/<layer>/       immutable directory trees
 //! snapshots/<id>.json   a snapshot: a chain of layers, bottom first
-//! trash/<id>/           deleted snapshots, restorable until the trash is emptied
+//! worktrees/<id>/       a worktree: a snapshot and a private upper layer
+//! trash/<id>/           deleted snapshots and worktrees, restorable until the
+//!                       trash is emptied
 //! tmp/<entry>/          work in progress, locked by the process doing it
 //! ```
 //!
@@ -37,13 +39,20 @@ use crate::error::{Error, Next, Reason};
 
 mod at;
 mod git;
+mod overlay;
 mod owner;
 mod snapshot;
+mod squash;
 mod trash;
 mod tree;
+mod worktree;
 
+pub use overlay::{Backend, Privilege};
 pub use snapshot::{Created, Deleted, Method, Snapshot};
 pub use trash::{Emptied, Kind, Restored, TrashEntry};
+pub use worktree::{
+    CreatedWorktree, DeletedWorktree, Mounted, Prepared, Sealed, WORKTREE_VARIABLE, Worktree,
+};
 
 /// The version of the store layout this beavy reads and writes.
 pub const FORMAT: u32 = 1;
@@ -55,6 +64,7 @@ const STORE_FILE: &str = "store.json";
 const LOCK_FILE: &str = "lock";
 const LAYERS: &str = "layers";
 const SNAPSHOTS: &str = "snapshots";
+const WORKTREES: &str = "worktrees";
 const TRASH: &str = "trash";
 const TMP: &str = "tmp";
 
@@ -291,6 +301,11 @@ impl Store {
         self.root.join(relative)
     }
 
+    /// The store's path with symlinks resolved, as the kernel reports it in mounts.
+    pub(crate) fn absolute(&self) -> PathBuf {
+        fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone())
+    }
+
     /// Act as the store's owner on this thread until the guard drops. Every public
     /// operation starts here. A store that doesn't exist yet will belong to the
     /// caller. Refuses a store that users other than its owner can write, a store
@@ -433,7 +448,7 @@ impl Store {
             }
             Err(err) => return Err(fs_error(err, format!("read {shown}"))),
         }
-        for dir in [LAYERS, SNAPSHOTS, TRASH, TMP] {
+        for dir in [LAYERS, SNAPSHOTS, WORKTREES, TRASH, TMP] {
             let path = self.join(dir);
             match fs::create_dir(&path) {
                 Err(err) if err.kind() != ErrorKind::AlreadyExists => {
@@ -482,7 +497,8 @@ impl Store {
     }
 
     /// Remove leftovers of interrupted commands: tmp/ entries no process holds,
-    /// half-written records and trash entries, and layers no snapshot uses. Only
+    /// half-written records and trash entries, and layers no snapshot uses. Finish
+    /// interrupted seals, and detach mounts of worktrees that no longer exist. Only
     /// names beavy makes are touched.
     fn repair(&self, guard: &Guard) -> Result<Vec<Warning>, Error> {
         let mut warnings = Vec::new();
@@ -505,6 +521,7 @@ impl Store {
                 let _ = fs::remove_file(self.join(SNAPSHOTS).join(entry));
             }
         }
+        warnings.extend(self.repair_worktrees(guard)?);
         warnings.extend(self.repair_trash()?);
         if let Some(trash) = self.trash_unused_layers(guard)? {
             warnings.extend(trash.discard());
@@ -631,7 +648,7 @@ pub(crate) fn is_id(prefix: &str, id: &str) -> bool {
 }
 
 /// A temporary file [`write_record`] left: `.<name>.<random id>`.
-fn is_temporary_record(name: &std::ffi::OsStr) -> bool {
+pub(crate) fn is_temporary_record(name: &std::ffi::OsStr) -> bool {
     let name = name.as_bytes();
     name.len() > 12
         && name.starts_with(b".")
@@ -679,7 +696,7 @@ pub(crate) fn random_id() -> String {
         .collect()
 }
 
-/// Check a snapshot name: 1 to 63 lowercase letters, numbers, and
+/// Check a snapshot or worktree name: 1 to 63 lowercase letters, numbers, and
 /// hyphens, starting and ending with a letter or number. IDs contain `_`, so a
 /// name never looks like an ID.
 pub fn validate_name(name: &str) -> Result<(), Error> {

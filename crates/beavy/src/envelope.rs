@@ -23,6 +23,10 @@ pub enum WarningReason {
     CleanupFailed,
     /// An import left out entries it can't copy, such as sockets.
     EntriesSkipped,
+    /// The store is on overlayfs, where worktrees are slow or refused.
+    StoreOnOverlayfs,
+    /// A sealed worktree couldn't be mounted again where it was mounted before.
+    RemountFailed,
 }
 
 /// A successful result: `schemaVersion`, the result's own top-level keys, then

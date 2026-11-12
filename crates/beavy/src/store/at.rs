@@ -71,6 +71,15 @@ pub(crate) fn open_dir(path: &Path) -> io::Result<OwnedFd> {
     )?)
 }
 
+/// Open the directory at the absolute `path` without following a symlink anywhere
+/// on the way.
+pub(crate) fn open_dir_no_symlinks(path: &Path) -> io::Result<OwnedFd> {
+    let relative = path
+        .strip_prefix("/")
+        .map_err(|_| io::Error::from(Errno::INVAL))?;
+    open_dir_beneath(open_dir(Path::new("/"))?, relative)
+}
+
 /// Open the directory `relative` beneath `dir`.
 pub(crate) fn open_dir_beneath(dir: impl AsFd, relative: &Path) -> io::Result<OwnedFd> {
     beneath(

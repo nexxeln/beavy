@@ -25,6 +25,8 @@ pub enum Method {
     Copy,
     /// A copy of a directory whose files were all cloned with reflinks.
     Reflink,
+    /// A worktree's changes, sealed.
+    Seal,
 }
 
 impl Method {
@@ -32,6 +34,7 @@ impl Method {
         match self {
             Method::Copy => "copy",
             Method::Reflink => "reflink",
+            Method::Seal => "seal",
         }
     }
 }
@@ -49,6 +52,9 @@ pub(crate) struct SnapshotRecord {
     pub source: String,
     pub commit: Option<String>,
     pub method: Method,
+    /// The worktree a sealed snapshot came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
     pub created_at: String,
 }
 
@@ -61,11 +67,14 @@ pub struct Snapshot {
     pub name: Option<String>,
     /// The snapshot this one was made from, or null for an imported one.
     pub parent: Option<String>,
-    /// The directory the base layer was imported from.
+    /// The directory the base layer was imported from. Worktrees of this snapshot
+    /// are entered at this path.
     pub source: String,
     /// The Git commit checked out when the snapshot was taken, if any.
     pub commit: Option<String>,
     pub method: Method,
+    /// The worktree a sealed snapshot came from; null for an imported one.
+    pub worktree: Option<String>,
     /// Layers in the chain, the base included.
     pub depth: usize,
     pub created_at: String,
@@ -171,6 +180,7 @@ impl Store {
             git::detach(scratch.dir(), commit).map_err(|err| {
                 fs_error(err, format!("detach HEAD in {}", scratch.path().display()))
             })?;
+            git::refresh_index(&directory, scratch.path());
         }
         sync_data(scratch.dir(), scratch.path())?;
         let record = SnapshotRecord {
@@ -186,6 +196,7 @@ impl Store {
             } else {
                 Method::Copy
             },
+            worktree: None,
             created_at: time::now(),
         };
 
@@ -238,7 +249,7 @@ impl Store {
     }
 
     /// Move a snapshot to the trash. Its layers stay until the trash is emptied.
-    /// Refused while another snapshot was made from it.
+    /// Refused while another snapshot was made from it or a worktree uses it.
     pub fn delete_snapshot(&self, selector: &str) -> Result<Deleted, Error> {
         let _acting = self.act()?;
         if !self.exists()? {
@@ -263,6 +274,28 @@ impl Store {
             .with_next(
                 "See what depends on it",
                 self.next(&["beavy", "snapshots", "inspect", &record.id]),
+            ));
+        }
+
+        let worktrees: Vec<String> = self
+            .worktree_records()?
+            .into_iter()
+            .filter(|worktree| worktree.snapshot == record.id)
+            .map(|worktree| worktree.id)
+            .collect();
+        if !worktrees.is_empty() {
+            return Err(Error::new(
+                Reason::SnapshotInUse,
+                format!(
+                    "Can't delete snapshot {}. {} use it: {}.",
+                    record.id,
+                    plural(worktrees.len(), "worktree", "worktrees"),
+                    listing(&worktrees)
+                ),
+            )
+            .with_next(
+                "Delete a worktree",
+                self.next(&["beavy", "worktrees", "delete", &worktrees[0]]),
             ));
         }
 
@@ -387,6 +420,7 @@ pub(crate) fn view(record: &SnapshotRecord, records: &[SnapshotRecord]) -> Snaps
         source: record.source.clone(),
         commit: record.commit.clone(),
         method: record.method,
+        worktree: record.worktree.clone(),
         depth: record.layers.len(),
         created_at: record.created_at.clone(),
         children: records

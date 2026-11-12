@@ -21,6 +21,8 @@ mod snapshots;
 mod store;
 #[cfg(target_os = "linux")]
 mod trash;
+#[cfg(target_os = "linux")]
+mod worktrees;
 
 const HELP_TEMPLATE: &str = "{usage-heading} {usage}\n{about}\n\n{all-args}{after-help}";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -28,7 +30,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Root help groups commands by task. Every subcommand that isn't hidden must
 /// appear in exactly one group.
 const COMMAND_GROUPS: &[(&str, &[&str])] = &[
-    ("Snapshots", &["snapshots", "trash"]),
+    ("Worktrees", &["worktrees", "snapshots", "trash"]),
     ("Machine", &["host"]),
 ];
 
@@ -71,7 +73,7 @@ struct Global {
     version: bool,
 }
 
-/// Where snapshots live.
+/// Where snapshots and worktrees live.
 #[derive(Args)]
 struct StoreArgs {
     /// Store directory (default: one per project, under ~/.local/share/beavy/stores)
@@ -81,6 +83,14 @@ struct StoreArgs {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Create worktrees of a snapshot and run commands in them
+    #[command(help_template = HELP_TEMPLATE, subcommand_value_name = "COMMAND")]
+    Worktrees {
+        #[command(flatten)]
+        store: StoreArgs,
+        #[command(subcommand)]
+        command: Option<WorktreesCommand>,
+    },
     /// Create, inspect, and delete snapshots of a project
     #[command(help_template = HELP_TEMPLATE, subcommand_value_name = "COMMAND")]
     Snapshots {
@@ -89,7 +99,7 @@ enum Command {
         #[command(subcommand)]
         command: Option<SnapshotsCommand>,
     },
-    /// Restore deleted snapshots, or empty the trash
+    /// Restore deleted snapshots and worktrees, or empty the trash
     #[command(help_template = HELP_TEMPLATE, subcommand_value_name = "COMMAND")]
     Trash {
         #[command(flatten)]
@@ -113,12 +123,15 @@ enum Command {
 
 #[derive(Subcommand)]
 enum SnapshotsCommand {
-    /// Create a snapshot of the project directory
+    /// Create a snapshot of the project directory, or of a worktree
     #[command(help_template = HELP_TEMPLATE, after_help = SNAPSHOTS_CREATE_HELP)]
     Create {
         /// Name for the snapshot, unique in the store
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
+        /// Seal this worktree into the snapshot instead of importing the project
+        #[arg(long, value_name = "WORKTREE")]
+        worktree: Option<String>,
     },
     /// List snapshots
     #[command(help_template = HELP_TEMPLATE, after_help = SNAPSHOTS_LIST_HELP)]
@@ -140,14 +153,77 @@ enum SnapshotsCommand {
 }
 
 #[derive(Subcommand)]
+enum WorktreesCommand {
+    /// Create a worktree of a snapshot
+    #[command(help_template = HELP_TEMPLATE, after_help = WORKTREES_CREATE_HELP)]
+    Create {
+        /// Snapshot ID or name
+        #[arg(value_name = "SNAPSHOT")]
+        snapshot: String,
+        /// Name for the worktree, unique in the store
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+    },
+    /// List worktrees
+    #[command(help_template = HELP_TEMPLATE, after_help = WORKTREES_LIST_HELP)]
+    List,
+    /// Show a worktree
+    #[command(help_template = HELP_TEMPLATE, after_help = WORKTREES_INSPECT_HELP)]
+    Inspect {
+        /// Worktree ID or name
+        #[arg(value_name = "WORKTREE")]
+        worktree: String,
+    },
+    /// Run a command in a worktree
+    #[command(help_template = HELP_TEMPLATE, after_help = WORKTREES_RUN_HELP)]
+    Run {
+        /// Worktree ID or name
+        #[arg(value_name = "WORKTREE")]
+        worktree: String,
+        /// The command and its arguments, after --
+        #[arg(
+            value_name = "COMMAND",
+            required = true,
+            trailing_var_arg = true,
+            allow_hyphen_values = true
+        )]
+        command: Vec<OsString>,
+    },
+    /// Mount a worktree at a directory for every process (root only)
+    #[command(help_template = HELP_TEMPLATE, after_help = WORKTREES_MOUNT_HELP)]
+    Mount {
+        /// Worktree ID or name
+        #[arg(value_name = "WORKTREE")]
+        worktree: String,
+        /// Directory to mount it on
+        #[arg(value_name = "DIR")]
+        dir: PathBuf,
+    },
+    /// Unmount a worktree's persistent mount
+    #[command(help_template = HELP_TEMPLATE, after_help = WORKTREES_UNMOUNT_HELP)]
+    Unmount {
+        /// Worktree ID or name
+        #[arg(value_name = "WORKTREE")]
+        worktree: String,
+    },
+    /// Move a worktree to the trash
+    #[command(help_template = HELP_TEMPLATE, after_help = WORKTREES_DELETE_HELP)]
+    Delete {
+        /// Worktree ID or name
+        #[arg(value_name = "WORKTREE")]
+        worktree: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum TrashCommand {
-    /// List deleted snapshots
+    /// List deleted snapshots and worktrees
     #[command(help_template = HELP_TEMPLATE, after_help = TRASH_LIST_HELP)]
     List,
-    /// Restore a deleted snapshot
+    /// Restore a deleted snapshot or worktree
     #[command(help_template = HELP_TEMPLATE, after_help = TRASH_RESTORE_HELP)]
     Restore {
-        /// ID of the deleted snapshot
+        /// ID of the deleted snapshot or worktree
         #[arg(value_name = "ID")]
         id: String,
     },
@@ -168,6 +244,9 @@ Examples:
   Snapshot a project by name and read the result as JSON
     beavy snapshots create --cwd <DIR> --name <NAME> --json
 
+  Seal a worktree's changes into a snapshot
+    beavy snapshots create --worktree <WORKTREE>
+
 Notes:
   The project is the nearest directory above --cwd that has a store, else the
   root of its Git working tree, else --cwd itself. The command copies it into
@@ -176,7 +255,89 @@ Notes:
   It refuses linked worktrees and repositories in the middle of a merge,
   rebase, cherry-pick, revert, or bisect.
 
+  With --worktree, the worktree's changes become the new snapshot's top layer
+  without a copy, and the worktree carries on from the new snapshot. Past a
+  depth of 8 layers, the layers above the base are merged into one.
+
 Learn more: https://github.com/nexxeln/beavy/blob/main/docs/cli-contract.md#beavy-snapshots-create";
+
+const WORKTREES_CREATE_HELP: &str = "\
+Examples:
+  Create a worktree of a snapshot
+    beavy worktrees create <SNAPSHOT>
+
+  Create a named worktree and read its ID as JSON
+    beavy worktrees create <SNAPSHOT> --name <NAME> --json
+
+Notes:
+  A worktree is a snapshot plus a private layer that holds its changes. Creating
+  one copies nothing. beavy mounts it once with overlayfs first, so it fails
+  here, with the fix, when this machine can't run worktrees.
+
+Learn more: https://github.com/nexxeln/beavy/blob/main/docs/cli-contract.md#beavy-worktrees-create";
+
+const WORKTREES_LIST_HELP: &str = "\
+Examples:
+  List worktrees, newest first
+    beavy worktrees list
+
+Learn more: https://github.com/nexxeln/beavy/blob/main/docs/cli-contract.md#beavy-worktrees-list";
+
+const WORKTREES_INSPECT_HELP: &str = "\
+Examples:
+  Show a worktree, its mounts, and the commands running in it, as JSON
+    beavy worktrees inspect <WORKTREE> --json
+
+Learn more: https://github.com/nexxeln/beavy/blob/main/docs/cli-contract.md#beavy-worktrees-inspect";
+
+const WORKTREES_RUN_HELP: &str = "\
+Examples:
+  Run the tests in a worktree
+    beavy worktrees run <WORKTREE> -- pnpm test
+
+  Open a shell in a worktree
+    beavy worktrees run <WORKTREE> -- bash
+
+Notes:
+  The command runs in its own mount namespace, with the worktree mounted over
+  the directory its snapshot was imported from, so it sees the project at its
+  usual path. Nothing outside the command sees the worktree. The command starts
+  in the current directory when that's inside the project, and at the project
+  root otherwise. beavy replaces itself with the command, so its output, signals,
+  user, and exit status are the command's own. BEAVY_WORKTREE holds the
+  worktree's ID. Commands in one worktree can run at the same time; they share
+  one mount.
+
+Learn more: https://github.com/nexxeln/beavy/blob/main/docs/cli-contract.md#beavy-worktrees-run";
+
+const WORKTREES_MOUNT_HELP: &str = "\
+Examples:
+  Mount a worktree where every process can see it
+    sudo beavy worktrees mount <WORKTREE> <DIR>
+
+Notes:
+  Needs root. A worktree has one mount at a time, and mounting is refused while
+  commands run in it.
+
+Learn more: https://github.com/nexxeln/beavy/blob/main/docs/cli-contract.md#beavy-worktrees-mount";
+
+const WORKTREES_UNMOUNT_HELP: &str = "\
+Examples:
+  Unmount a worktree
+    sudo beavy worktrees unmount <WORKTREE>
+
+Learn more: https://github.com/nexxeln/beavy/blob/main/docs/cli-contract.md#beavy-worktrees-unmount";
+
+const WORKTREES_DELETE_HELP: &str = "\
+Examples:
+  Delete a worktree
+    beavy worktrees delete <WORKTREE>
+
+Notes:
+  The worktree is unmounted and moves to the trash; its changes stay on disk
+  until beavy trash empty. Refused while commands run in it.
+
+Learn more: https://github.com/nexxeln/beavy/blob/main/docs/cli-contract.md#beavy-worktrees-delete";
 
 const SNAPSHOTS_LIST_HELP: &str = "\
 Examples:
@@ -199,20 +360,21 @@ Examples:
 
 Notes:
   The snapshot moves to the trash and its data stays on disk until
-  beavy trash empty. Refused while another snapshot was made from it.
+  beavy trash empty. Refused while another snapshot was made from it or a
+  worktree uses it.
 
 Learn more: https://github.com/nexxeln/beavy/blob/main/docs/cli-contract.md#beavy-snapshots-delete";
 
 const TRASH_LIST_HELP: &str = "\
 Examples:
-  List deleted snapshots, most recently deleted first
+  List deleted snapshots and worktrees, most recently deleted first
     beavy trash list
 
 Learn more: https://github.com/nexxeln/beavy/blob/main/docs/cli-contract.md#beavy-trash-list";
 
 const TRASH_RESTORE_HELP: &str = "\
 Examples:
-  Restore a deleted snapshot
+  Restore a deleted snapshot or worktree
     beavy trash restore <ID>
 
 Learn more: https://github.com/nexxeln/beavy/blob/main/docs/cli-contract.md#beavy-trash-restore";
@@ -223,8 +385,8 @@ Examples:
     beavy trash empty --yes
 
 Notes:
-  Deletes every snapshot in the trash, with the data only they use. This can't
-  be undone, so a run without a terminal needs --yes.
+  Deletes every snapshot and worktree in the trash, with the data only they
+  use. This can't be undone, so a run without a terminal needs --yes.
 
 Learn more: https://github.com/nexxeln/beavy/blob/main/docs/cli-contract.md#beavy-trash-empty";
 
@@ -321,6 +483,12 @@ fn dispatch(
         }) => host::check(output, &working_directory(&cli.global)?),
         Some(Command::Snapshots { command: None, .. }) => help(root, &["snapshots".into()], output),
         Some(Command::Trash { command: None, .. }) => help(root, &["trash".into()], output),
+        Some(Command::Worktrees { command: None, .. }) => help(root, &["worktrees".into()], output),
+        #[cfg(target_os = "linux")]
+        Some(Command::Worktrees {
+            store,
+            command: Some(command),
+        }) => worktrees::run(output, &cli.global, store, command),
         #[cfg(target_os = "linux")]
         Some(Command::Snapshots {
             store,
@@ -332,7 +500,9 @@ fn dispatch(
             command: Some(command),
         }) => trash::run(output, &cli.global, store, command),
         #[cfg(not(target_os = "linux"))]
-        Some(Command::Snapshots { .. } | Command::Trash { .. }) => Err(unavailable().into()),
+        Some(Command::Snapshots { .. } | Command::Trash { .. } | Command::Worktrees { .. }) => {
+            Err(unavailable().into())
+        }
     }
 }
 
@@ -346,12 +516,12 @@ fn working_directory(global: &Global) -> Result<PathBuf, Error> {
     }
 }
 
-/// The store only runs on Linux so far, so every other platform refuses snapshots.
+/// Snapshots and worktrees need overlayfs, so every platform but Linux refuses them.
 #[cfg(not(target_os = "linux"))]
 fn unavailable() -> Error {
     Error::new(
         Reason::BackendUnavailable,
-        "Can't use snapshots on this system yet. beavy's store only runs on Linux so far.",
+        "Can't use snapshots or worktrees on this system yet. beavy's worktree backend is overlayfs, which only Linux has.",
     )
     .with_next(
         "See which backends this machine supports",

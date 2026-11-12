@@ -1,17 +1,20 @@
 use std::ffi::CString;
 use std::fs::{self, File, Permissions};
-use std::io::{self, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::io::{self, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
 use super::{Check, PlatformChecks, Support, uname_release};
+use crate::sys::{
+    ChildResult, IdMaps, STAGE_CHDIR, STAGE_MAP, STAGE_MOUNT, STAGE_PRIVATE, STAGE_UNSHARE, errno,
+    has_cap_sys_admin, in_child,
+};
 
 pub(super) const NAME: &str = "linux";
 
 const FICLONE: libc::c_ulong = 0x4004_9409;
-const CAP_SYS_ADMIN: u32 = 21;
 
 pub(super) fn kernel_release() -> Option<String> {
     uname_release()
@@ -24,7 +27,7 @@ pub(super) fn os_version(kernel: Option<&str>) -> Option<String> {
 /// The filesystem type of `path`, from the mount table entry whose device matches
 /// the path's device, falling back to statfs magic numbers that name exactly one
 /// filesystem.
-pub(super) fn filesystem_type(path: &Path) -> Option<String> {
+pub(crate) fn filesystem_type(path: &Path) -> Option<String> {
     let dev = fs::metadata(path).ok()?.dev();
     let (major, minor) = (
         ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff),
@@ -160,162 +163,8 @@ fn overlayfs_available() -> Check {
     }
 }
 
-fn has_cap_sys_admin() -> bool {
-    let Ok(status) = fs::read_to_string("/proc/self/status") else {
-        return false;
-    };
-    status
-        .lines()
-        .find_map(|line| line.strip_prefix("CapEff:"))
-        .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
-        .is_some_and(|caps| caps & (1 << CAP_SYS_ADMIN) != 0)
-}
-
-/// Files and contents for entering a user namespace with this process's IDs mapped
-/// to root, prepared before fork so the child only makes syscalls.
-struct IdMaps {
-    setgroups: CString,
-    uid_map: CString,
-    gid_map: CString,
-    deny: Vec<u8>,
-    uid_line: Vec<u8>,
-    gid_line: Vec<u8>,
-}
-
-impl IdMaps {
-    fn new() -> Self {
-        // SAFETY: geteuid and getegid have no preconditions.
-        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-        IdMaps {
-            setgroups: c"/proc/self/setgroups".to_owned(),
-            uid_map: c"/proc/self/uid_map".to_owned(),
-            gid_map: c"/proc/self/gid_map".to_owned(),
-            deny: b"deny".to_vec(),
-            uid_line: format!("0 {uid} 1").into_bytes(),
-            gid_line: format!("0 {gid} 1").into_bytes(),
-        }
-    }
-
-    /// Runs in the forked child: async-signal-safe calls only.
-    fn enter(&self) -> Result<(), (u8, i32)> {
-        // SAFETY: unshare takes flags only.
-        if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) } != 0 {
-            return Err((STAGE_UNSHARE, errno()));
-        }
-        write_file(&self.setgroups, &self.deny).map_err(|e| (STAGE_MAP, e))?;
-        write_file(&self.uid_map, &self.uid_line).map_err(|e| (STAGE_MAP, e))?;
-        write_file(&self.gid_map, &self.gid_line).map_err(|e| (STAGE_MAP, e))?;
-        Ok(())
-    }
-}
-
-const STAGE_UNSHARE: u8 = 1;
-const STAGE_MAP: u8 = 2;
-const STAGE_CHDIR: u8 = 3;
-const STAGE_PRIVATE: u8 = 4;
-const STAGE_MOUNT: u8 = 5;
-
-fn errno() -> i32 {
-    io::Error::last_os_error().raw_os_error().unwrap_or(0)
-}
-
-fn write_file(path: &CString, contents: &[u8]) -> Result<(), i32> {
-    // SAFETY: path is NUL-terminated; the descriptor is closed before returning.
-    unsafe {
-        let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
-        if fd < 0 {
-            return Err(errno());
-        }
-        let written = libc::write(fd, contents.as_ptr().cast(), contents.len());
-        let result = if written == contents.len() as isize {
-            Ok(())
-        } else {
-            Err(errno())
-        };
-        libc::close(fd);
-        result
-    }
-}
-
-enum ChildResult {
-    Succeeded,
-    Failed { stage: u8, err: io::Error },
-    Abnormal(String),
-}
-
-/// Run `work` in a forked child so namespace changes never touch this process.
-/// `work` must make only async-signal-safe calls: the parent may have other threads.
-fn in_child(work: impl FnOnce() -> Result<(), (u8, i32)>) -> ChildResult {
-    let mut fds = [0; 2];
-    // SAFETY: fds has room for two descriptors.
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return ChildResult::Abnormal(format!(
-            "Couldn't create a pipe: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    // SAFETY: pipe2 returned two open descriptors that nothing else owns.
-    let (read_end, write_end) =
-        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-
-    // SAFETY: the child calls only async-signal-safe functions, then _exit.
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        return ChildResult::Abnormal(format!("Couldn't fork: {}", io::Error::last_os_error()));
-    }
-    if pid == 0 {
-        let code = match work() {
-            Ok(()) => 0,
-            Err((stage, err)) => {
-                let mut message = [0u8; 5];
-                message[0] = stage;
-                message[1..].copy_from_slice(&err.to_ne_bytes());
-                // SAFETY: the write end is open and message is 5 bytes.
-                unsafe { libc::write(write_end.as_raw_fd(), message.as_ptr().cast(), 5) };
-                1
-            }
-        };
-        // SAFETY: _exit ends the child without running the parent's destructors.
-        unsafe { libc::_exit(code) };
-    }
-
-    drop(write_end);
-    let mut message = Vec::new();
-    let _ = File::from(read_end).read_to_end(&mut message);
-    let mut status = 0;
-    loop {
-        // SAFETY: pid is our child and status is a valid out pointer.
-        let rc = unsafe { libc::waitpid(pid, &mut status, 0) };
-        if rc == pid {
-            break;
-        }
-        if rc < 0 && errno() != libc::EINTR {
-            return ChildResult::Abnormal(format!(
-                "Couldn't wait for the probe process: {}",
-                io::Error::last_os_error()
-            ));
-        }
-    }
-    if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
-        return ChildResult::Succeeded;
-    }
-    if let [stage, a, b, c, d] = message[..] {
-        return ChildResult::Failed {
-            stage,
-            err: io::Error::from_raw_os_error(i32::from_ne_bytes([a, b, c, d])),
-        };
-    }
-    if libc::WIFSIGNALED(status) {
-        return ChildResult::Abnormal(format!(
-            "The probe process was stopped by signal {}",
-            libc::WTERMSIG(status)
-        ));
-    }
-    ChildResult::Abnormal("The probe process exited without a result".into())
-}
-
 fn user_namespaces() -> Check {
-    let maps = IdMaps::new();
+    let maps = IdMaps::to_root();
     match in_child(|| maps.enter()) {
         ChildResult::Succeeded => Check::new(
             Support::Supported,
@@ -353,7 +202,7 @@ fn overlayfs_mount(dir: &Path, fs_name: &str) -> (Check, bool) {
     };
 
     let privileged = has_cap_sys_admin();
-    let maps = IdMaps::new();
+    let maps = IdMaps::to_root();
     let source = c"overlay";
     let target = c"merged";
     let options = c"lowerdir=lower,upperdir=upper,workdir=work";
