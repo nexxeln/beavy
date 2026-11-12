@@ -2,7 +2,7 @@ use std::io::Write;
 
 use beavy::Document;
 use beavy::output::{Format, Output};
-use beavy::store::Snapshot;
+use beavy::store::{Snapshot, Worktree};
 use serde::Serialize;
 
 use crate::store::{self, Opened, StoreView};
@@ -16,7 +16,14 @@ pub fn run<O: Write, E: Write>(
 ) -> Result<(), Failure> {
     let opened = store::open(global, args)?;
     match command {
-        SnapshotsCommand::Create { name } => create(output, &opened, name.as_deref()),
+        SnapshotsCommand::Create {
+            name,
+            worktree: Some(worktree),
+        } => seal(output, &opened, worktree, name.as_deref()),
+        SnapshotsCommand::Create {
+            name,
+            worktree: None,
+        } => create(output, &opened, name.as_deref()),
         SnapshotsCommand::List => list(output, &opened),
         SnapshotsCommand::Inspect { snapshot } => inspect(output, &opened, snapshot),
         SnapshotsCommand::Delete { snapshot } => delete(output, &opened, snapshot),
@@ -92,6 +99,61 @@ fn create<O: Write, E: Write>(
 }
 
 #[derive(Serialize)]
+struct Sealed<'a> {
+    snapshot: &'a Snapshot,
+    outcome: &'static str,
+    worktree: &'a Worktree,
+    squashed: bool,
+    store: StoreView,
+}
+
+fn seal<O: Write, E: Write>(
+    output: &mut Output<O, E>,
+    opened: &Opened,
+    worktree: &str,
+    name: Option<&str>,
+) -> Result<(), Failure> {
+    let sealed = opened.store.create_snapshot_from_worktree(worktree, name)?;
+    let snapshot = &sealed.snapshot;
+    let create = opened
+        .store
+        .next(&["beavy", "worktrees", "create", &snapshot.id]);
+    if output.mode().format == Format::Json {
+        let document = Document::new(Sealed {
+            snapshot,
+            outcome: "created",
+            worktree: &sealed.worktree,
+            squashed: sealed.squashed,
+            store: opened.view(),
+        })
+        .with_warnings(sealed.warnings.clone())
+        .with_next(create);
+        output.json(&document)?;
+        return Ok(());
+    }
+    let mut stderr = output.stderr();
+    stderr.receipt("Created", &snapshot.id)?;
+    if let Some(name) = &snapshot.name {
+        stderr.row("Name", name)?;
+    }
+    stderr.row("Worktree", &sealed.worktree.id)?;
+    stderr.row("Parent", snapshot.parent.as_deref().unwrap_or("-"))?;
+    if let Some(commit) = &snapshot.commit {
+        stderr.row("Commit", commit)?;
+    }
+    let depth = if sealed.squashed {
+        format!("{} (squashed)", snapshot.depth)
+    } else {
+        snapshot.depth.to_string()
+    };
+    stderr.row("Depth", &depth)?;
+    stderr.next("Start another worktree from it", &create.command)?;
+    output.warnings(&sealed.warnings)?;
+    output.identifier(&snapshot.id)?;
+    Ok(())
+}
+
+#[derive(Serialize)]
 struct Listed<'a> {
     snapshots: &'a [Snapshot],
     store: StoreView,
@@ -162,6 +224,7 @@ fn inspect<O: Write, E: Write>(
     stdout.row("Source", &snapshot.source)?;
     stdout.row("Commit", &snapshot.commit.clone().unwrap_or_else(none))?;
     stdout.row("Method", snapshot.method.as_str())?;
+    stdout.row("Worktree", snapshot.worktree.as_deref().unwrap_or("-"))?;
     stdout.row("Depth", &snapshot.depth.to_string())?;
     stdout.row("Created", &format::detail_time(&snapshot.created_at))?;
     let children = if snapshot.children.is_empty() {
