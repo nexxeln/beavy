@@ -33,8 +33,9 @@ use super::snapshot::{self, Method, Snapshot, SnapshotRecord};
 use super::squash::{self, SQUASH_DEPTH};
 use super::trash::Kind;
 use super::{
-    FORMAT, Guard, LAYERS, SNAPSHOTS, Store, WORKTREES, at, crash_point, fs_error, list_dir,
-    lock_file, owner, random_id, read_record, try_lock_file, validate_name, write_record,
+    FORMAT, Guard, LAYERS, SNAPSHOTS, Store, WORKTREES, at, crash_point, damaged, fs_error, is_id,
+    is_random_id, is_temporary_record, list_dir, lock_file, owner, random_id, read_record,
+    try_lock_file, validate_name, write_record,
 };
 use crate::envelope::Warning;
 use crate::error::{Error, Next, Reason};
@@ -708,7 +709,8 @@ impl Store {
         if !self.join(SNAPSHOTS).join(&record_name).exists() {
             write_record(&self.join(SNAPSHOTS), &record_name, &journal.snapshot)?;
         }
-        let mut record: WorktreeRecord = read_record(&dir.join(RECORD))?.ok_or_else(|| {
+        let path = dir.join(RECORD);
+        let mut record: WorktreeRecord = read_record(&path)?.ok_or_else(|| {
             Error::new(
                 Reason::InvalidStore,
                 format!(
@@ -717,6 +719,7 @@ impl Store {
                 ),
             )
         })?;
+        check(&record, &path, &record.id)?;
         if record.snapshot != journal.snapshot.id {
             let upper = dir.join(UPPER);
             if fs::symlink_metadata(&upper).is_ok() {
@@ -740,15 +743,20 @@ impl Store {
     pub(crate) fn repair_worktrees(&self, guard: &Guard) -> Result<Vec<Warning>, Error> {
         let mut warnings = Vec::new();
         for id in list_dir(&self.join(WORKTREES))? {
+            if !id.to_str().is_some_and(|id| is_id("wt", id)) {
+                continue;
+            }
             let dir = self.join(WORKTREES).join(&id);
             for name in list_dir(&dir)? {
-                if name.to_str().is_some_and(|name| name.starts_with('.')) {
+                if is_temporary_record(&name) {
                     let _ = fs::remove_file(dir.join(name));
                 }
             }
-            let Some(journal) = read_record::<SealRecord>(&dir.join(SEAL))? else {
+            let path = dir.join(SEAL);
+            let Some(journal) = read_record::<SealRecord>(&path)? else {
                 continue;
             };
+            check_seal(&journal, &path)?;
             if self.join(LAYERS).join(&journal.layer).exists() {
                 warnings.extend(self.finish_seal(guard, &dir, &journal)?);
             } else {
@@ -781,8 +789,12 @@ impl Store {
     pub(crate) fn worktree_records(&self) -> Result<Vec<WorktreeRecord>, Error> {
         let mut records = Vec::new();
         for id in list_dir(&self.join(WORKTREES))? {
+            let Some(id) = id.to_str().filter(|id| is_id("wt", id)) else {
+                continue;
+            };
             let path = self.join(WORKTREES).join(id).join(RECORD);
             if let Some(record) = read_record::<WorktreeRecord>(&path)? {
+                check(&record, &path, id)?;
                 records.push(record);
             }
         }
@@ -1098,6 +1110,35 @@ impl Store {
             self.next(&["beavy", "worktrees", "list"]),
         )
     }
+}
+
+/// Check a worktree record read from `path` before any of it becomes part of a
+/// path: its ID must be `id`, the name of its directory.
+pub(crate) fn check(record: &WorktreeRecord, path: &Path, id: &str) -> Result<(), Error> {
+    if !is_id("wt", &record.id) || record.id != id {
+        return Err(damaged(path, format!("its ID {:?} isn't {id}", record.id)));
+    }
+    if !is_id("snap", &record.snapshot) {
+        return Err(damaged(path, "its snapshot isn't a snapshot ID"));
+    }
+    if record
+        .name
+        .as_deref()
+        .is_some_and(|name| validate_name(name).is_err())
+    {
+        return Err(damaged(path, "its name isn't a valid name"));
+    }
+    Ok(())
+}
+
+/// Check a seal journal: the layer it adds is a layer name, and the top of the
+/// snapshot it records.
+fn check_seal(journal: &SealRecord, path: &Path) -> Result<(), Error> {
+    snapshot::check(&journal.snapshot, path, &journal.snapshot.id)?;
+    if !is_random_id(&journal.layer) || journal.snapshot.layers.last() != Some(&journal.layer) {
+        return Err(damaged(path, "its layer isn't the snapshot's top layer"));
+    }
+    Ok(())
 }
 
 pub(crate) fn find<'a>(

@@ -195,8 +195,11 @@ impl Store {
                         ),
                     ));
                 }
-                let worktree: Option<super::worktree::WorktreeRecord> =
-                    read_record(&payload.join("worktree.json"))?;
+                let path = payload.join("worktree.json");
+                let worktree: Option<super::worktree::WorktreeRecord> = read_record(&path)?;
+                if let Some(worktree) = &worktree {
+                    super::worktree::check(worktree, &path, &record.id)?;
+                }
                 let snapshot = worktree.map(|w| w.snapshot).unwrap_or_default();
                 if !self.snapshot_records()?.iter().any(|s| s.id == snapshot) {
                     let mut error = Error::new(

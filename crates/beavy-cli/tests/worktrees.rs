@@ -620,6 +620,63 @@ fn root_mounts_a_worktree_for_every_process() {
 }
 
 #[test]
+fn worktree_records_are_checked_before_their_ids_become_paths() {
+    let Some(f) = Fixture::new() else { return };
+    let victim = f.home.join("victim");
+    fs::create_dir(&victim).unwrap();
+    fs::write(victim.join("data"), "keep").unwrap();
+    let wt = f.ok(&["worktrees", "create", "base", "--name", "evil"]);
+    let dir = f.store.join("worktrees").join(&wt);
+    let record = dir.join("worktree.json");
+    let text = fs::read_to_string(&record).unwrap();
+    let snapshot = f.json(&["snapshots", "inspect", "base"])["snapshot"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for replaced in [&wt, &snapshot] {
+        fs::write(
+            &record,
+            text.replace(replaced.as_str(), "../../home/victim"),
+        )
+        .unwrap();
+        for args in [
+            &["worktrees", "list", "--json"][..],
+            &["worktrees", "delete", "evil", "--json"],
+            &["worktrees", "run", "evil", "--json", "--", "true"],
+        ] {
+            assert_eq!(refuse(f.beavy(args))["reason"], "invalid_store", "{args:?}");
+        }
+    }
+    fs::write(&record, &text).unwrap();
+
+    f.sh(&wt, "echo sealed > sealed.txt");
+    let killed = f
+        .beavy(&["snapshots", "create", "--worktree", &wt])
+        .env("__BEAVY_CRASH_AT", "seal-journal")
+        .output()
+        .unwrap();
+    assert_eq!(killed.status.signal(), Some(libc::SIGKILL));
+    let journal = dir.join("seal.json");
+    let text = fs::read_to_string(&journal).unwrap();
+    let layer = serde_json::from_str::<Value>(&text).unwrap()["layer"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    fs::write(&journal, text.replace(&layer, "../../home/victim")).unwrap();
+    assert_eq!(
+        refuse(f.beavy(&["worktrees", "run", &wt, "--json", "--", "true"]))["reason"],
+        "invalid_store"
+    );
+    let mut left: Vec<_> = fs::read_dir(&victim)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    left.sort();
+    assert_eq!(left, ["data"]);
+    assert_eq!(fs::read_to_string(victim.join("data")).unwrap(), "keep");
+}
+
+#[test]
 fn through_sudo_worktrees_belong_to_and_run_as_the_user_who_ran_it() {
     let Some(f) = Fixture::new() else { return };
     let Some(user) = sudo_user() else { return };

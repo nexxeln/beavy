@@ -648,7 +648,7 @@ pub(crate) fn is_id(prefix: &str, id: &str) -> bool {
 }
 
 /// A temporary file [`write_record`] left: `.<name>.<random id>`.
-fn is_temporary_record(name: &std::ffi::OsStr) -> bool {
+pub(crate) fn is_temporary_record(name: &std::ffi::OsStr) -> bool {
     let name = name.as_bytes();
     name.len() > 12
         && name.starts_with(b".")

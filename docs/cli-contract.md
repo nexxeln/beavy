@@ -341,7 +341,9 @@ upper layer, so what it shows doesn't change. If the chain would be deeper than 
 layers, beavy merges every layer above the base into one first (see
 [the design](design/worktrees.md#squashing)). A persistent mount is unmounted for
 the seal and mounted again afterwards; failing that is a `remount_failed` warning.
-Sealing fails with `worktree_in_use` while commands run in the worktree.
+Sealing fails with `worktree_in_use` while commands run in the worktree. A
+record or seal journal that fails beavy's checks fails the command with
+`invalid_store`.
 
 A name is 1 to 63 lowercase letters, digits, and hyphens, starting and ending with a
 letter or digit, and unique among the store's snapshots (`name_taken`). The
