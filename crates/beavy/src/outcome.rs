@@ -11,6 +11,8 @@ pub enum Outcome {
     Failure,
     /// The input was invalid or incomplete, so no work started.
     Usage,
+    /// The user declined a confirmation the operation needs.
+    Canceled,
 }
 
 impl Outcome {
@@ -19,6 +21,7 @@ impl Outcome {
             Outcome::Success => 0,
             Outcome::Failure => 1,
             Outcome::Usage => 2,
+            Outcome::Canceled => 130,
         }
     }
 }
@@ -32,5 +35,6 @@ mod tests {
         assert_eq!(Outcome::Success.exit_code(), 0);
         assert_eq!(Outcome::Failure.exit_code(), 1);
         assert_eq!(Outcome::Usage.exit_code(), 2);
+        assert_eq!(Outcome::Canceled.exit_code(), 130);
     }
 }

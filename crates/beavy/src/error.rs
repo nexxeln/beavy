@@ -15,10 +15,14 @@ pub enum ErrorClass {
     NotFound,
     /// The process isn't allowed to do what was asked.
     Permission,
+    /// The request conflicts with the current state, such as a resource in use.
+    Conflict,
     /// The operating system or a tool beavy runs failed.
     System,
     /// A defect in beavy itself.
     Internal,
+    /// The user declined a confirmation the operation needs.
+    Canceled,
 }
 
 impl ErrorClass {
@@ -27,8 +31,10 @@ impl ErrorClass {
             ErrorClass::Usage | ErrorClass::MissingInput => Outcome::Usage,
             ErrorClass::NotFound
             | ErrorClass::Permission
+            | ErrorClass::Conflict
             | ErrorClass::System
             | ErrorClass::Internal => Outcome::Failure,
+            ErrorClass::Canceled => Outcome::Canceled,
         }
     }
 
@@ -59,10 +65,17 @@ pub enum Reason {
     UnknownOption,
     UnknownCommand,
     MissingArgument,
+    ConfirmationRequired,
     NotFound,
     PermissionDenied,
+    NameTaken,
+    SnapshotInUse,
+    UnsupportedGitState,
     IoError,
+    InvalidStore,
+    BackendUnavailable,
     InternalError,
+    Canceled,
 }
 
 impl Reason {
@@ -71,11 +84,17 @@ impl Reason {
             Reason::InvalidArguments | Reason::UnknownOption | Reason::UnknownCommand => {
                 ErrorClass::Usage
             }
-            Reason::MissingArgument => ErrorClass::MissingInput,
+            Reason::MissingArgument | Reason::ConfirmationRequired => ErrorClass::MissingInput,
             Reason::NotFound => ErrorClass::NotFound,
             Reason::PermissionDenied => ErrorClass::Permission,
-            Reason::IoError => ErrorClass::System,
+            Reason::NameTaken | Reason::SnapshotInUse | Reason::UnsupportedGitState => {
+                ErrorClass::Conflict
+            }
+            Reason::IoError | Reason::InvalidStore | Reason::BackendUnavailable => {
+                ErrorClass::System
+            }
             Reason::InternalError => ErrorClass::Internal,
+            Reason::Canceled => ErrorClass::Canceled,
         }
     }
 
@@ -85,10 +104,17 @@ impl Reason {
             Reason::UnknownOption => "unknown_option",
             Reason::UnknownCommand => "unknown_command",
             Reason::MissingArgument => "missing_argument",
+            Reason::ConfirmationRequired => "confirmation_required",
             Reason::NotFound => "not_found",
             Reason::PermissionDenied => "permission_denied",
+            Reason::NameTaken => "name_taken",
+            Reason::SnapshotInUse => "snapshot_in_use",
+            Reason::UnsupportedGitState => "unsupported_git_state",
             Reason::IoError => "io_error",
+            Reason::InvalidStore => "invalid_store",
+            Reason::BackendUnavailable => "backend_unavailable",
             Reason::InternalError => "internal_error",
+            Reason::Canceled => "canceled",
         }
     }
 }
@@ -252,10 +278,17 @@ mod tests {
             (Reason::UnknownOption, 2, Status::Error),
             (Reason::UnknownCommand, 2, Status::Error),
             (Reason::MissingArgument, 2, Status::ActionRequired),
+            (Reason::ConfirmationRequired, 2, Status::ActionRequired),
             (Reason::NotFound, 1, Status::Error),
             (Reason::PermissionDenied, 1, Status::Error),
+            (Reason::NameTaken, 1, Status::Error),
+            (Reason::SnapshotInUse, 1, Status::Error),
+            (Reason::UnsupportedGitState, 1, Status::Error),
             (Reason::IoError, 1, Status::Error),
+            (Reason::InvalidStore, 1, Status::Error),
+            (Reason::BackendUnavailable, 1, Status::Error),
             (Reason::InternalError, 1, Status::Error),
+            (Reason::Canceled, 130, Status::Error),
         ];
         for (reason, exit, status) in cases {
             assert_eq!(reason.class().outcome().exit_code(), exit, "{reason:?}");
@@ -270,10 +303,17 @@ mod tests {
             Reason::UnknownOption,
             Reason::UnknownCommand,
             Reason::MissingArgument,
+            Reason::ConfirmationRequired,
             Reason::NotFound,
             Reason::PermissionDenied,
+            Reason::NameTaken,
+            Reason::SnapshotInUse,
+            Reason::UnsupportedGitState,
             Reason::IoError,
+            Reason::InvalidStore,
+            Reason::BackendUnavailable,
             Reason::InternalError,
+            Reason::Canceled,
         ] {
             assert_eq!(
                 serde_json::to_value(reason).unwrap(),

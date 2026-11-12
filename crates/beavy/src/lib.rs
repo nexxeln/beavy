@@ -13,6 +13,9 @@ pub mod error;
 pub mod host;
 pub mod outcome;
 pub mod output;
+#[cfg(target_os = "linux")]
+pub mod store;
+pub mod time;
 
 pub use envelope::{Document, SCHEMA_VERSION, Warning, WarningReason};
 pub use error::{Error, ErrorClass, Next, Reason, Status};

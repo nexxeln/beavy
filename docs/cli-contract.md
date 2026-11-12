@@ -36,7 +36,9 @@ Each invocation resolves four settings independently, once, in `output::Mode`.
 - Complete input behaves the same with or without a terminal. Piping stdout changes
   only stdout's presentation: it never selects JSON and never turns prompts off.
 - Prompts need an interactive run. A non-interactive run that's missing input fails
-  at once with `missing_argument` (exit 2) instead of waiting. No command prompts yet.
+  at once with `missing_argument` (exit 2) instead of waiting. The only prompt today
+  is the confirmation in `beavy trash empty`; `--yes` answers it, and a
+  non-interactive run without `--yes` fails with `confirmation_required` (exit 2).
 - An agent is detected by any of `AI_AGENT`, `CLAUDECODE`, `CODEX_SANDBOX`,
   `CURSOR_AGENT`, or `GEMINI_CLI` being set and nonempty. Detection only turns
   prompts off; the agent still gets human output unless it passes `--json`.
@@ -51,7 +53,7 @@ Each invocation resolves four settings independently, once, in `output::Mode`.
 | 0 | The promised operation completed: a result, an empty result, a no-op, help, or the version |
 | 1 | The input was accepted and the operation failed |
 | 2 | Usage error or missing input: nothing ran |
-| 130 | Interrupted with Ctrl+C (SIGINT) |
+| 130 | Interrupted with Ctrl+C (SIGINT), or a confirmation was declined |
 | 128 + n | Terminated by signal n, such as 143 for SIGTERM |
 
 The error's reason fixes its class and the class fixes the exit code, so the exit
@@ -112,10 +114,17 @@ On failure with `--json`, stderr gets one line:
 | `unknown_option` | Usage | 2 | `error` | An option isn't defined for the command |
 | `unknown_command` | Usage | 2 | `error` | A command path segment doesn't exist |
 | `missing_argument` | Missing input | 2 | `action_required` | Required input is missing and the run can't prompt for it |
-| `not_found` | Not found | 1 | `error` | A named file or directory doesn't exist |
-| `permission_denied` | Permission | 1 | `error` | The process isn't allowed to read or change what was named |
+| `confirmation_required` | Missing input | 2 | `action_required` | A command that destroys data needs `--yes` in a non-interactive run |
+| `not_found` | Not found | 1 | `error` | A named file, directory, snapshot, or trash entry doesn't exist |
+| `permission_denied` | Permission | 1 | `error` | The process isn't allowed to read or change what was named, or beavy won't use the store: it belongs to another user, other users can write to it, or, as root, another user could replace it |
+| `name_taken` | Conflict | 1 | `error` | Another snapshot in the store has the name |
+| `snapshot_in_use` | Conflict | 1 | `error` | A snapshot can't be deleted while another snapshot was made from it |
+| `unsupported_git_state` | Conflict | 1 | `error` | The project is a linked Git worktree or submodule, or its repository is in the middle of a merge, rebase, cherry-pick, revert, or bisect |
 | `io_error` | System | 1 | `error` | The operating system failed a read or write |
+| `invalid_store` | System | 1 | `error` | The store has a layout version this beavy can't read, or a damaged record, such as one whose ID isn't an ID |
+| `backend_unavailable` | System | 1 | `error` | This platform can't keep snapshots yet: beavy's store only runs on Linux |
 | `internal_error` | Internal | 1 | `error` | A bug in beavy |
+| `canceled` | Canceled | 130 | `error` | The user declined a confirmation; nothing changed |
 
 A code never changes meaning once published. New codes are added to this table and
 to `error::Reason` in the same change.
@@ -125,6 +134,7 @@ to `error::Reason` in the same change.
 | Reason | When |
 | --- | --- |
 | `cleanup_failed` | A temporary file or directory beavy created couldn't be removed. The message names the path |
+| `entries_skipped` | An import left out entries it can't copy: sockets and device nodes. The message names them |
 
 ## Human output
 
@@ -160,6 +170,65 @@ one exact command when there is one:
 
 Not built yet: machine-readable help (`--help --json`), `help search`, and
 `--fields`. Until they exist, they aren't part of the contract.
+
+## Environment variables
+
+| Variable | Effect |
+| --- | --- |
+| `BEAVY_STORE` | The store directory when `--store` isn't given. Empty counts as unset |
+| `XDG_DATA_HOME`, `HOME` | Where default stores live (see [Stores](#stores)) |
+| `NO_COLOR`, `FORCE_COLOR`, `TERM`, `CI`, agent variables | See [Modes](#modes) |
+
+## Stores
+
+Snapshots live in a store: an ordinary directory that beavy creates
+on first use and never writes outside of. Deleting a project's store removes every
+trace of beavy from it.
+
+A `snapshots` or `trash` command picks its store in this order:
+
+1. `--store <DIR>`.
+2. `BEAVY_STORE`.
+3. The project's default store, `$XDG_DATA_HOME/beavy/stores/<name>-<hash>`, or
+   `~/.local/share/beavy/stores/<name>-<hash>` when `XDG_DATA_HOME` isn't set.
+   `<name>` is the project directory's name and `<hash>` is derived from its path,
+   so the default store is always outside the project.
+
+The project is the nearest directory at or above `--cwd` that already has a default
+store, else the root of the Git working tree around it, else `--cwd` itself. Every
+suggested command repeats the `--cwd` and `--store` the caller passed.
+
+Reads never create a store; the first change does, in a directory that doesn't
+exist or is empty. A directory with anything else in it fails with
+`invalid_arguments`, so beavy never adopts, or cleans up, files it didn't make.
+Every change takes the store's lock and first repairs whatever an interrupted
+command left behind, so a killed command never leaves a half-made snapshot in
+view. Repair only touches names beavy makes. A store records its layout version,
+and a beavy that can't read it fails with `invalid_store`. beavy checks every
+record before using an ID or layer name from it as part of a path, and a record
+that fails the check fails the command with `invalid_store`. Layer data is on
+disk before the record that names it.
+
+A store belongs to the user who created it, and every file beavy reads or writes
+in a store, it reads or writes as that user:
+
+- Run as a user, beavy uses only that user's stores. A store owned by someone else
+  fails with `permission_denied`.
+- Run through `sudo`, beavy works for the user who ran sudo (`SUDO_UID` and
+  `SUDO_GID`): it creates and changes stores as that user, so nothing in a store
+  or on the way to it ends up owned by root. When sudo set `HOME` to root's home,
+  the default store is under the invoking user's home instead. A store that user
+  doesn't own fails with `permission_denied`.
+- Run as root with no invoking user, such as from a root login, beavy works in a
+  root-owned store as root and in another user's store as that user. A root-owned
+  store fails with `permission_denied` when a directory on the way to it belongs
+  to another user or is writable by others without the sticky bit, because that
+  user could replace it while beavy works.
+
+beavy refuses a store that users other than its owner can write, with
+`permission_denied` and a next command that removes their write access.
+Snapshots need Linux; on other platforms these commands fail with
+`backend_unavailable`.
 
 ## Commands
 
@@ -235,6 +304,113 @@ Result:
 
 Human output prints the facts as label/value rows, then the backends as a table,
 on stdout.
+
+### beavy snapshots create
+
+Import the project into the store as a new snapshot.
+
+```
+beavy snapshots create [--name <NAME>] [--store <DIR>] [--json]
+```
+
+The command copies the project into the store once. It clones
+files with `FICLONE` when the filesystem supports reflinks and copies them
+otherwise. It keeps modes, times, symlinks, FIFOs, and hard links, and ownership
+only when it works as root. It never reads or writes through a symlink, and each
+file keeps the owner and mode of the file it actually read. It skips sockets and
+device nodes with an `entries_skipped` warning.
+The project itself is only read, and never becomes part of a mount. In the copy,
+Git's HEAD is detached at the current commit, with the index and working tree as
+they were. A linked Git worktree or submodule fails with `unsupported_git_state`
+and a next command for the main working tree. A repository in the middle of a
+merge, rebase, cherry-pick, revert, or bisect, or locked by a running git, fails
+the same way.
+
+A name is 1 to 63 lowercase letters, digits, and hyphens, starting and ending with a
+letter or digit, and unique among the store's snapshots (`name_taken`). The
+snapshot ID prints alone on stdout; everything else goes to stderr.
+
+Result:
+
+```json
+{ "schemaVersion": 1, "snapshot": { "...": "..." }, "outcome": "created", "import": { "files": 388848, "bytes": 3812664320 }, "store": { "path": "/home/me/.local/share/beavy/stores/acme-3f9a1c2e" } }
+```
+
+A snapshot object:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `id` | string | `snap_` and 10 characters |
+| `name` | string or null | |
+| `parent` | string or null | The snapshot this one was made from; null for an import |
+| `source` | string | The directory the chain's base was imported from |
+| `commit` | string or null | The Git commit checked out when the snapshot was taken |
+| `method` | `"copy"` or `"reflink"` | How the top layer was made |
+| `depth` | integer | Layers in the chain, the base included |
+| `createdAt` | string | RFC 3339 UTC time |
+| `children` | array of strings | Snapshots whose parent is this one |
+
+### beavy snapshots list
+
+```
+beavy snapshots list [--store <DIR>] [--json]
+```
+
+Result: `{ "snapshots": [<snapshot>], "store": { "path": "..." } }`, newest first.
+Human output is a table of ID, Name, Parent, Depth, and Created on stdout.
+
+### beavy snapshots inspect
+
+```
+beavy snapshots inspect <SNAPSHOT> [--store <DIR>] [--json]
+```
+
+`<SNAPSHOT>` is an ID or a name. Result: `{ "snapshot": <snapshot>, "store": { "path": "..." } }`.
+An unknown snapshot fails with `not_found`.
+
+### beavy snapshots delete
+
+```
+beavy snapshots delete <SNAPSHOT> [--store <DIR>] [--json]
+```
+
+Moves the snapshot to the trash; its data stays on disk until
+`beavy trash empty`. Fails with `snapshot_in_use` while another snapshot was made
+from it. Result: `{ "snapshot": <snapshot>, "outcome": "deleted", "store": { "path": "..." } }`,
+with next commands to list snapshots and to restore this one.
+
+### beavy trash list
+
+```
+beavy trash list [--store <DIR>] [--json]
+```
+
+Result: `{ "entries": [{ "id": "...", "kind": "snapshot", "name": null, "deletedAt": "..." }], "store": { "path": "..." } }`,
+most recently deleted first. `kind` is `"snapshot"`.
+
+### beavy trash restore
+
+```
+beavy trash restore <ID> [--store <DIR>] [--json]
+```
+
+Puts a deleted snapshot back under its old ID. Fails with `name_taken` when a live
+snapshot has its name now. Result: `{ "entry": <entry>, "outcome": "restored", "store": { "path": "..." } }`.
+
+### beavy trash empty
+
+```
+beavy trash empty [-y, --yes] [--store <DIR>] [--json]
+```
+
+Deletes everything in the trash for good, with the layers no live snapshot uses.
+It deletes only the entries it counted before asking, so an entry trashed while
+the question was open stays in the trash.
+An interactive run asks first; declining exits 130 with `canceled`. A
+non-interactive run needs `--yes`, and without it fails with
+`confirmation_required` (exit 2) and a next command whose `when` says to run it
+only after a human approves. Result: `{ "entries": [<entry>], "outcome": "emptied", "store": { "path": "..." } }`,
+or `"outcome": "unchanged"` when the trash was already empty.
 
 ## Changing the contract
 
