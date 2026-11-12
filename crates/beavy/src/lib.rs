@@ -11,6 +11,7 @@
 pub mod envelope;
 pub mod error;
 pub mod outcome;
+pub mod output;
 
 pub use envelope::{Document, SCHEMA_VERSION, Warning, WarningReason};
 pub use error::{Error, ErrorClass, Next, Reason, Status};
