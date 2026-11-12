@@ -508,7 +508,7 @@ fn commands_in_one_worktree_share_a_mount_and_block_changes() {
             "--",
             "sh",
             "-c",
-            "echo shared > marker && sleep 3",
+            "readlink /proc/self/ns/mnt > marker && sleep 3",
         ])
         .spawn()
         .unwrap();
@@ -525,7 +525,14 @@ fn commands_in_one_worktree_share_a_mount_and_block_changes() {
         std::thread::sleep(Duration::from_millis(20));
     }
     std::thread::sleep(Duration::from_millis(200));
-    assert_eq!(f.sh(&wt, "cat marker"), "shared\n");
+    assert_eq!(
+        f.sh(&wt, "readlink /proc/self/ns/mnt; cat marker")
+            .lines()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        1,
+        "the second run has its own mount"
+    );
 
     let refused = f
         .beavy(&["snapshots", "create", "--worktree", &wt, "--json"])
@@ -541,7 +548,7 @@ fn commands_in_one_worktree_share_a_mount_and_block_changes() {
 
     assert!(first.wait().unwrap().success());
     f.ok(&["snapshots", "create", "--worktree", &wt]);
-    assert_eq!(f.sh(&wt, "cat marker"), "shared\n");
+    assert_eq!(f.sh(&wt, "cat marker").lines().count(), 1);
 }
 
 #[test]
