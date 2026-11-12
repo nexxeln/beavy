@@ -594,11 +594,37 @@ impl Store {
         let _entering = self.lock_worktree(&record.id)?;
         let before = self.fresh_view(&record)?;
         self.ensure_idle(&before)?;
-        self.unmount_all(&before)?;
         let parent = self.snapshot_of(&record)?;
-        let dir = self.join(WORKTREES).join(&record.id);
-        let upper = dir.join(UPPER);
+        self.unmount_all(&before)?;
+        let sealed = self.seal(guard, &before, &parent, name, &mut warnings);
+        let layers = match &sealed {
+            Ok((journal, _)) => &journal.snapshot.layers,
+            Err(_) => &parent.layers,
+        };
+        self.remount(&record.id, layers, &before.mounts, &mut warnings);
+        let (journal, squashed) = sealed?;
 
+        let snapshots = self.snapshot_records()?;
+        Ok(Sealed {
+            snapshot: snapshot::view(&journal.snapshot, &snapshots),
+            worktree: self.fresh_view(&self.find_worktree(&record.id)?)?,
+            squashed,
+            warnings,
+        })
+    }
+
+    /// Turn the unmounted worktree's upper layer into a snapshot, squashing the
+    /// chain when it's too deep.
+    fn seal(
+        &self,
+        guard: Guard,
+        worktree: &Worktree,
+        parent: &SnapshotRecord,
+        name: Option<&str>,
+        warnings: &mut Vec<Warning>,
+    ) -> Result<(SealRecord, bool), Error> {
+        let dir = self.join(WORKTREES).join(&worktree.id);
+        let upper = dir.join(UPPER);
         let layer = random_id();
         let squashed = parent.layers.len() + 1 > SQUASH_DEPTH;
         let merged = if squashed {
@@ -644,7 +670,7 @@ impl Store {
                 source: parent.source.clone(),
                 commit,
                 method: Method::Seal,
-                worktree: Some(record.id.clone()),
+                worktree: Some(worktree.id.clone()),
                 created_at: time::now(),
             },
         };
@@ -663,36 +689,7 @@ impl Store {
         })?;
         crash_point("seal-layer");
         warnings.extend(self.finish_seal(&guard, &dir, &journal)?);
-        let relative = Path::new(WORKTREES).join(&record.id);
-        for point in &before.mounts {
-            let mounted = self
-                .spec(&journal.snapshot.layers, &relative)
-                .and_then(|spec| {
-                    let dir = at::open_dir_no_symlinks(Path::new(point))
-                        .map_err(|err| fs_error(err, format!("open {point}")))?;
-                    overlay::mount_persistent(&spec, &dir)
-                        .map_err(|failure| self.mount_failure(failure, Privilege::Root))
-                });
-            if let Err(err) = mounted {
-                warnings.push(Warning {
-                    reason: crate::envelope::WarningReason::RemountFailed,
-                    message: format!(
-                        "Sealed worktree {}, but couldn't mount it at {point} again: {}",
-                        record.id,
-                        err.message()
-                    ),
-                });
-            }
-        }
-        drop(guard);
-
-        let snapshots = self.snapshot_records()?;
-        Ok(Sealed {
-            snapshot: snapshot::view(&journal.snapshot, &snapshots),
-            worktree: self.fresh_view(&self.find_worktree(&record.id)?)?,
-            squashed,
-            warnings,
-        })
+        Ok((journal, squashed))
     }
 
     /// Record the sealed snapshot, give the worktree a fresh upper layer on it, and
@@ -891,6 +888,30 @@ impl Store {
             .and_then(|store| at::open_dir_beneath(&store, relative))
             .map_err(|err| fs_error(err, format!("open {}", path.display())))
             .and_then(|fd| Opened::new(&path, fd))
+    }
+
+    /// Mount the worktree again at each of `points`, after a change that unmounted
+    /// it failed or finished. A failure is a warning: the worktree is intact.
+    fn remount(&self, id: &str, layers: &[String], points: &[String], warnings: &mut Vec<Warning>) {
+        for point in points {
+            let mounted = self
+                .spec(layers, &Path::new(WORKTREES).join(id))
+                .and_then(|spec| {
+                    let dir = at::open_dir_no_symlinks(Path::new(point))
+                        .map_err(|err| fs_error(err, format!("open {point}")))?;
+                    overlay::mount_persistent(&spec, &dir)
+                        .map_err(|failure| self.mount_failure(failure, Privilege::Root))
+                });
+            if let Err(err) = mounted {
+                warnings.push(Warning {
+                    reason: crate::envelope::WarningReason::RemountFailed,
+                    message: format!(
+                        "Couldn't mount worktree {id} at {point} again: {}",
+                        err.message()
+                    ),
+                });
+            }
+        }
     }
 
     fn mount_failure(&self, failure: Failure, privilege: Privilege) -> Error {
