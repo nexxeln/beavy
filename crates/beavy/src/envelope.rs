@@ -21,6 +21,8 @@ pub struct Warning {
 pub enum WarningReason {
     /// A temporary file or directory beavy created couldn't be removed.
     CleanupFailed,
+    /// An import left out entries it can't copy, such as sockets.
+    EntriesSkipped,
 }
 
 /// A successful result: `schemaVersion`, the result's own top-level keys, then

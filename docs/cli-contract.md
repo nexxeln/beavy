@@ -113,9 +113,13 @@ On failure with `--json`, stderr gets one line:
 | `unknown_command` | Usage | 2 | `error` | A command path segment doesn't exist |
 | `missing_argument` | Missing input | 2 | `action_required` | Required input is missing and the run can't prompt for it |
 | `confirmation_required` | Missing input | 2 | `action_required` | A command that destroys data needs `--yes` in a non-interactive run |
-| `not_found` | Not found | 1 | `error` | A named file or directory doesn't exist |
+| `not_found` | Not found | 1 | `error` | A named file, directory, snapshot, or trash entry doesn't exist |
 | `permission_denied` | Permission | 1 | `error` | The process isn't allowed to read or change what was named |
+| `name_taken` | Conflict | 1 | `error` | Another snapshot in the store has the name |
+| `snapshot_in_use` | Conflict | 1 | `error` | A snapshot can't be deleted while another snapshot was made from it |
+| `unsupported_git_state` | Conflict | 1 | `error` | The project is a linked Git worktree or submodule, or its repository is in the middle of a merge, rebase, cherry-pick, revert, or bisect |
 | `io_error` | System | 1 | `error` | The operating system failed a read or write |
+| `invalid_store` | System | 1 | `error` | The store has a layout version this beavy can't read, or a damaged record |
 | `internal_error` | Internal | 1 | `error` | A bug in beavy |
 | `canceled` | Canceled | 130 | `error` | The user declined a confirmation; nothing changed |
 
@@ -127,6 +131,7 @@ to `error::Reason` in the same change.
 | Reason | When |
 | --- | --- |
 | `cleanup_failed` | A temporary file or directory beavy created couldn't be removed. The message names the path |
+| `entries_skipped` | An import left out entries it can't copy: sockets, and device nodes when beavy isn't root. The message names them |
 
 ## Human output
 
