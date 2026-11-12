@@ -403,6 +403,8 @@ beavy trash empty [-y, --yes] [--store <DIR>] [--json]
 ```
 
 Deletes everything in the trash for good, with the layers no live snapshot uses.
+It deletes only the entries it counted before asking, so an entry trashed while
+the question was open stays in the trash.
 An interactive run asks first; declining exits 130 with `canceled`. A
 non-interactive run needs `--yes`, and without it fails with
 `confirmation_required` (exit 2) and a next command whose `when` says to run it

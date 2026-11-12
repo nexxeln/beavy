@@ -4,6 +4,7 @@
 #![cfg(target_os = "linux")]
 
 use std::fs;
+use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -433,6 +434,68 @@ fn a_symlinked_head_is_never_written_through() {
         fs::read_to_string(other.join("HEAD")).unwrap(),
         "ref: refs/heads/main\n"
     );
+}
+
+#[test]
+fn emptying_the_trash_deletes_only_what_was_approved() {
+    use std::os::fd::{FromRawFd, OwnedFd};
+
+    let f = Fixture::new();
+    let first = f.ok(&["snapshots", "create"]).trim().to_string();
+    let second = f.ok(&["snapshots", "create"]).trim().to_string();
+    f.ok(&["snapshots", "delete", &first]);
+
+    let (mut controller, mut terminal) = (0, 0);
+    // SAFETY: both out pointers are valid; null name, termios, and winsize are allowed.
+    let rc = unsafe {
+        libc::openpty(
+            &mut controller,
+            &mut terminal,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
+    // SAFETY: openpty returned two open descriptors that nothing else owns.
+    let (controller, terminal) = unsafe {
+        (
+            OwnedFd::from_raw_fd(controller),
+            OwnedFd::from_raw_fd(terminal),
+        )
+    };
+    let child = Command::new(env!("CARGO_BIN_EXE_beavy"))
+        .args(["trash", "empty"])
+        .current_dir(&f.project)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", &f.home)
+        .env("BEAVY_STORE", &f.store)
+        .env("TERM", "xterm")
+        .stdin(Stdio::from(terminal.try_clone().unwrap()))
+        .stderr(Stdio::from(terminal))
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut screen = fs::File::from(controller);
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !String::from_utf8_lossy(&seen).contains("Empty the trash?") {
+        match screen.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => seen.extend_from_slice(&buf[..n]),
+        }
+    }
+    let prompt = String::from_utf8_lossy(&seen).into_owned();
+    assert!(prompt.contains("Deletes 1 snapshot"), "{prompt}");
+
+    f.ok(&["snapshots", "delete", &second]);
+    screen.write_all(b"y\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let left = f.json(&["trash", "list"])["entries"].clone();
+    assert_eq!(left.as_array().unwrap().len(), 1, "{left}");
+    assert_eq!(left[0]["id"], second.as_str());
 }
 
 #[test]

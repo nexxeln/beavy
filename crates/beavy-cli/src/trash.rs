@@ -166,7 +166,8 @@ fn empty<O: Write, E: Write>(
             return Err(Error::new(Reason::Canceled, "Canceled. Nothing was deleted.").into());
         }
     }
-    let emptied = opened.store.empty_trash()?;
+    let ids: Vec<String> = entries.iter().map(|entry| entry.id.clone()).collect();
+    let emptied = opened.store.empty_trash(&ids)?;
     if output.mode().format == Format::Json {
         let document = Document::new(Emptied {
             entries: &emptied.entries,

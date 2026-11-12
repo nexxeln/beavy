@@ -183,9 +183,10 @@ impl Store {
         })
     }
 
-    /// Delete everything in the trash for good, and every layer that no live
-    /// snapshot uses.
-    pub fn empty_trash(&self) -> Result<Emptied, Error> {
+    /// Delete the trash entries named in `ids` for good, and every layer that no
+    /// live snapshot uses. `ids` are the entries the caller showed and had
+    /// approved, so anything deleted since stays in the trash.
+    pub fn empty_trash(&self, ids: &[String]) -> Result<Emptied, Error> {
         let _acting = self.act()?;
         if !self.exists()? {
             return Ok(Emptied {
@@ -194,7 +195,11 @@ impl Store {
             });
         }
         let (guard, mut warnings) = self.open_for_change()?;
-        let records = self.trash_records()?;
+        let records: Vec<EntryRecord> = self
+            .trash_records()?
+            .into_iter()
+            .filter(|record| ids.contains(&record.id))
+            .collect();
         let scratch = self.scratch(&guard)?;
         for record in &records {
             let from = self.join(TRASH).join(&record.id);
