@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use super::trash::Kind;
 use super::{
     FORMAT, LAYERS, SNAPSHOTS, Store, crash_point, damaged, fs_error, git, identity, is_id,
-    is_random_id, list_dir, random_id, read_record, tree, validate_name, write_record,
+    is_random_id, list_dir, random_id, read_record, sync_data, tree, validate_name, write_record,
 };
 use crate::envelope::{Warning, WarningReason};
 use crate::error::{Error, Reason};
@@ -172,6 +172,7 @@ impl Store {
                 fs_error(err, format!("detach HEAD in {}", scratch.path().display()))
             })?;
         }
+        sync_data(scratch.dir(), scratch.path())?;
         let record = SnapshotRecord {
             format: FORMAT,
             id: format!("snap_{}", random_id()),

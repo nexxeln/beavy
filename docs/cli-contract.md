@@ -206,7 +206,8 @@ command left behind, so a killed command never leaves a half-made snapshot in
 view. Repair only touches names beavy makes. A store records its layout version,
 and a beavy that can't read it fails with `invalid_store`. beavy checks every
 record before using an ID or layer name from it as part of a path, and a record
-that fails the check fails the command with `invalid_store`.
+that fails the check fails the command with `invalid_store`. Layer data is on
+disk before the record that names it.
 
 A store belongs to the user who created it, and every file beavy reads or writes
 in a store, it reads or writes as that user:

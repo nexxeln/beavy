@@ -651,6 +651,13 @@ pub(crate) fn damaged(path: &Path, problem: impl AsRef<str>) -> Error {
     )
 }
 
+/// Write everything on the filesystem that holds `dir` to disk, so a record never
+/// names data a power loss could take away.
+pub(crate) fn sync_data(dir: &File, shown: &Path) -> Result<(), Error> {
+    rustix::fs::syncfs(dir)
+        .map_err(|err| fs_error(err.into(), format!("write {} to disk", shown.display())))
+}
+
 /// Ten random characters from a lowercase alphabet without look-alikes.
 pub(crate) fn random_id() -> String {
     let mut bytes = [0u8; 10];
