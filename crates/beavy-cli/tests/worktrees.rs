@@ -8,7 +8,7 @@
 #![cfg(target_os = "linux")]
 
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{MetadataExt, symlink};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -634,6 +634,29 @@ fn root_mounts_a_worktree_for_every_process() {
         fs::read_to_string(dir.join("from-run")).unwrap(),
         "inside\n"
     );
+
+    let mut copy = Command::new("unshare")
+        .args(["-m", "sh", "-c", "echo ready; exec sleep 60"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut ready = String::new();
+    BufReader::new(copy.stdout.take().unwrap())
+        .read_line(&mut ready)
+        .unwrap();
+    let error = refuse(f.beavy(&["snapshots", "create", "--worktree", &wt, "--json"]));
+    copy.kill().unwrap();
+    copy.wait().unwrap();
+    assert_eq!(error["reason"], "worktree_in_use");
+    assert_eq!(
+        f.json(&["worktrees", "inspect", &wt])["worktree"]["mounts"],
+        serde_json::json!([dir.to_str().unwrap()])
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("from-run")).unwrap(),
+        "inside\n"
+    );
+
     assert_eq!(
         f.json(&["worktrees", "unmount", &wt])["outcome"],
         "unmounted"
