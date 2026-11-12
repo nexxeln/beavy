@@ -630,7 +630,9 @@ impl Store {
     }
 
     /// Turn the unmounted worktree's upper layer into a snapshot, squashing the
-    /// chain when it's too deep.
+    /// chain when it's too deep. The store lock is released while a squash merges
+    /// layers, so other worktrees carry on; the worktree's own lock, which the
+    /// caller holds, keeps everything else off this one.
     fn seal(
         &self,
         guard: Guard,
@@ -644,8 +646,9 @@ impl Store {
         let upper = dir.join(UPPER);
         let layer = random_id();
         let squashed = parent.layers.len() + 1 > SQUASH_DEPTH;
-        let merged = if squashed {
+        let (guard, merged) = if squashed {
             let scratch = self.scratch(&guard)?;
+            drop(guard);
             let mut sources: Vec<PathBuf> = parent.layers[1..]
                 .iter()
                 .map(|layer| self.join(LAYERS).join(layer))
@@ -653,9 +656,13 @@ impl Store {
             sources.push(upper.clone());
             let base = self.join(LAYERS).join(&parent.layers[0]);
             squash::merge(&base, &sources, scratch.path())?;
-            Some(scratch)
+            let guard = self.lock()?;
+            if let Some(name) = name {
+                self.ensure_snapshot_name_free(name)?;
+            }
+            (guard, Some(scratch))
         } else {
-            None
+            (guard, None)
         };
         let layers = if squashed {
             vec![parent.layers[0].clone(), layer.clone()]
