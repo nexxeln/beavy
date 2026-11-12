@@ -365,6 +365,14 @@ impl Store {
                 format!("Can't mount a worktree at {shown}. It's inside the store."),
             ));
         }
+        if self.absolute().starts_with(&dir) {
+            return Err(Error::new(
+                Reason::InvalidArguments,
+                format!(
+                    "Can't mount a worktree at {shown}. The store is inside it, and the mount would hide the store."
+                ),
+            ));
+        }
         let point =
             at::open_dir_no_symlinks(&dir).map_err(|err| fs_error(err, format!("open {shown}")))?;
         if let Some(uid) = owner::acting_uid() {

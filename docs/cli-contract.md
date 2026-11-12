@@ -518,8 +518,9 @@ beavy worktrees mount <WORKTREE> <DIR> [--store <DIR>] [--json]
 Mounts the worktree on `<DIR>` for every process. Needs root; without it, the
 command fails with `permission_denied` and suggests `beavy worktrees run`. A
 worktree has one mount at a time, and mounting fails with `worktree_in_use` while
-commands run in it. Through `sudo`, a `<DIR>` the user who ran sudo doesn't own
-fails with `permission_denied`. Result: `{ "worktree": <worktree>, "outcome": "mounted", "backend": <backend>, "store": { "path": "..." } }`,
+commands run in it. A `<DIR>` inside the store, or one the store is inside, fails
+with `invalid_arguments`; through `sudo`, a `<DIR>` the user who ran sudo
+doesn't own fails with `permission_denied`. Result: `{ "worktree": <worktree>, "outcome": "mounted", "backend": <backend>, "store": { "path": "..." } }`,
 or `"outcome": "unchanged"` when it's already mounted there.
 
 ### beavy worktrees unmount

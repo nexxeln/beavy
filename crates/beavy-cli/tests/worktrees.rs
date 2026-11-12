@@ -583,6 +583,15 @@ fn root_mounts_a_worktree_for_every_process() {
         return;
     }
     let wt = f.create("base");
+    let above = f.store.parent().unwrap().to_str().unwrap();
+    let error = refuse(f.beavy(&["worktrees", "mount", &wt, above, "--json"]));
+    assert_eq!(error["reason"], "invalid_arguments");
+    assert!(
+        f.json(&["worktrees", "inspect", &wt])["worktree"]["mounts"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     let dir = f.home.join("mnt");
     fs::create_dir(&dir).unwrap();
     let mounted = f.json(&["worktrees", "mount", &wt, dir.to_str().unwrap()]);
