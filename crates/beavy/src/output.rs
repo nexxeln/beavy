@@ -5,7 +5,7 @@
 //! document and stderr stays empty unless the command fails, in which case it
 //! holds exactly one single-line error document.
 
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 
 use serde::Serialize;
 
@@ -165,6 +165,32 @@ impl<O: Write, E: Write> Output<O, E> {
         self.stdout.flush()
     }
 
+    /// Print a mutation's identifier alone on stdout in human mode, unless the run
+    /// is interactive on a terminal, where the receipt already shows it. This is
+    /// what `id=$(beavy ...)` captures.
+    pub fn identifier(&mut self, id: &str) -> io::Result<()> {
+        let shown_in_receipt = self.mode.stdout.terminal && self.mode.interactive;
+        if self.mode.format == Format::Json || shown_in_receipt {
+            return Ok(());
+        }
+        writeln!(self.stdout, "{id}")?;
+        self.stdout.flush()
+    }
+
+    /// Ask a yes or no question on stderr and read the answer from `input`. Only
+    /// interactive runs may ask; anything but y or yes is no.
+    pub fn confirm(&mut self, question: &str, input: &mut impl BufRead) -> io::Result<bool> {
+        debug_assert!(self.mode.interactive);
+        write!(self.stderr, "? {question} (y/N) ")?;
+        self.stderr.flush()?;
+        let mut answer = String::new();
+        input.read_line(&mut answer)?;
+        Ok(matches!(
+            answer.trim().to_ascii_lowercase().as_str(),
+            "y" | "yes"
+        ))
+    }
+
     /// The human result stream.
     pub fn stdout(&mut self) -> Human<&mut O> {
         Human::new(&mut self.stdout, self.mode.stdout)
@@ -317,6 +343,30 @@ impl<W: Write> Human<W> {
             write_row(&mut row.iter().map(String::as_str))?;
         }
         Ok(())
+    }
+
+    /// The receipt's first row: `✓ Created         snap_x` when rich, the sentence
+    /// `Created snap_x` when plain.
+    pub fn receipt(&mut self, verb: &str, target: &str) -> io::Result<()> {
+        if self.presentation.rich {
+            let glyph = self.paint(GREEN, "✓");
+            writeln!(self.w, "{glyph} {verb:<LABEL_WIDTH$}{target}")
+        } else {
+            writeln!(self.w, "{verb} {target}")
+        }
+    }
+
+    /// An instruction and the exact command it introduces, after a blank line,
+    /// laid out like the recovery step of an error.
+    pub fn next(&mut self, instruction: &str, command: &str) -> io::Result<()> {
+        let command = if self.presentation.rich {
+            self.paint(CYAN, command)
+        } else {
+            command.to_string()
+        };
+        writeln!(self.w)?;
+        writeln!(self.w, "  {instruction}:")?;
+        writeln!(self.w, "    {command}")
     }
 
     /// The one primary completed result.
@@ -550,6 +600,71 @@ mod tests {
         );
         assert!(colored.contains("\x1b[31m✗\x1b[0m"));
         assert!(colored.contains("\x1b[36mbeavy host check --help\x1b[0m"));
+    }
+
+    #[test]
+    fn receipts_and_next_steps_follow_the_presentation() {
+        assert_eq!(
+            render(RICH, |h| h.receipt("Created", "snap_x").unwrap()),
+            "✓ Created         snap_x\n"
+        );
+        assert_eq!(
+            render(PLAIN, |h| h.receipt("Created", "snap_x").unwrap()),
+            "Created snap_x\n"
+        );
+        assert_eq!(
+            render(RICH, |h| h
+                .next("Restore it", "beavy trash restore snap_x")
+                .unwrap()),
+            "\n  Restore it:\n    beavy trash restore snap_x\n"
+        );
+        assert_eq!(
+            render(PLAIN, |h| h
+                .next("Restore it", "beavy trash restore snap_x")
+                .unwrap()),
+            "\n  Restore it:\n    beavy trash restore snap_x\n"
+        );
+    }
+
+    #[test]
+    fn identifiers_go_to_stdout_unless_a_terminal_shows_the_receipt() {
+        let capture = |mode: Mode| {
+            let mut out = Vec::new();
+            Output::new(mode, &mut out, io::sink())
+                .identifier("snap_x")
+                .unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        assert_eq!(
+            capture(resolve(ModeOptions::default(), NO_TTY, &[])),
+            "snap_x\n"
+        );
+        assert_eq!(capture(resolve(ModeOptions::default(), ALL_TTY, &[])), "");
+        assert_eq!(
+            capture(resolve(ModeOptions::default(), ALL_TTY, &[("CI", "1")])),
+            "snap_x\n"
+        );
+        assert_eq!(capture(resolve(json(), NO_TTY, &[])), "");
+    }
+
+    #[test]
+    fn confirm_accepts_only_yes() {
+        let mode = resolve(ModeOptions::default(), ALL_TTY, &[]);
+        for (answer, expected) in [
+            ("y\n", true),
+            ("YES\n", true),
+            ("\n", false),
+            ("n\n", false),
+            ("", false),
+        ] {
+            let mut err = Vec::new();
+            let mut output = Output::new(mode, io::sink(), &mut err);
+            let yes = output
+                .confirm("Empty the trash?", &mut answer.as_bytes())
+                .unwrap();
+            assert_eq!(yes, expected, "{answer:?}");
+            assert_eq!(String::from_utf8(err).unwrap(), "? Empty the trash? (y/N) ");
+        }
     }
 
     #[test]

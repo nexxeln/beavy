@@ -51,7 +51,7 @@ Each invocation resolves four settings independently, once, in `output::Mode`.
 | 0 | The promised operation completed: a result, an empty result, a no-op, help, or the version |
 | 1 | The input was accepted and the operation failed |
 | 2 | Usage error or missing input: nothing ran |
-| 130 | Interrupted with Ctrl+C (SIGINT) |
+| 130 | Interrupted with Ctrl+C (SIGINT), or a confirmation was declined |
 | 128 + n | Terminated by signal n, such as 143 for SIGTERM |
 
 The error's reason fixes its class and the class fixes the exit code, so the exit
@@ -112,10 +112,12 @@ On failure with `--json`, stderr gets one line:
 | `unknown_option` | Usage | 2 | `error` | An option isn't defined for the command |
 | `unknown_command` | Usage | 2 | `error` | A command path segment doesn't exist |
 | `missing_argument` | Missing input | 2 | `action_required` | Required input is missing and the run can't prompt for it |
+| `confirmation_required` | Missing input | 2 | `action_required` | A command that destroys data needs `--yes` in a non-interactive run |
 | `not_found` | Not found | 1 | `error` | A named file or directory doesn't exist |
 | `permission_denied` | Permission | 1 | `error` | The process isn't allowed to read or change what was named |
 | `io_error` | System | 1 | `error` | The operating system failed a read or write |
 | `internal_error` | Internal | 1 | `error` | A bug in beavy |
+| `canceled` | Canceled | 130 | `error` | The user declined a confirmation; nothing changed |
 
 A code never changes meaning once published. New codes are added to this table and
 to `error::Reason` in the same change.
