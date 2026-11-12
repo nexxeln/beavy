@@ -70,6 +70,7 @@ pub enum Reason {
     PermissionDenied,
     NameTaken,
     SnapshotInUse,
+    WorktreeInUse,
     UnsupportedGitState,
     IoError,
     InvalidStore,
@@ -87,9 +88,10 @@ impl Reason {
             Reason::MissingArgument | Reason::ConfirmationRequired => ErrorClass::MissingInput,
             Reason::NotFound => ErrorClass::NotFound,
             Reason::PermissionDenied => ErrorClass::Permission,
-            Reason::NameTaken | Reason::SnapshotInUse | Reason::UnsupportedGitState => {
-                ErrorClass::Conflict
-            }
+            Reason::NameTaken
+            | Reason::SnapshotInUse
+            | Reason::WorktreeInUse
+            | Reason::UnsupportedGitState => ErrorClass::Conflict,
             Reason::IoError | Reason::InvalidStore | Reason::BackendUnavailable => {
                 ErrorClass::System
             }
@@ -109,6 +111,7 @@ impl Reason {
             Reason::PermissionDenied => "permission_denied",
             Reason::NameTaken => "name_taken",
             Reason::SnapshotInUse => "snapshot_in_use",
+            Reason::WorktreeInUse => "worktree_in_use",
             Reason::UnsupportedGitState => "unsupported_git_state",
             Reason::IoError => "io_error",
             Reason::InvalidStore => "invalid_store",
@@ -283,6 +286,7 @@ mod tests {
             (Reason::PermissionDenied, 1, Status::Error),
             (Reason::NameTaken, 1, Status::Error),
             (Reason::SnapshotInUse, 1, Status::Error),
+            (Reason::WorktreeInUse, 1, Status::Error),
             (Reason::UnsupportedGitState, 1, Status::Error),
             (Reason::IoError, 1, Status::Error),
             (Reason::InvalidStore, 1, Status::Error),
@@ -308,6 +312,7 @@ mod tests {
             Reason::PermissionDenied,
             Reason::NameTaken,
             Reason::SnapshotInUse,
+            Reason::WorktreeInUse,
             Reason::UnsupportedGitState,
             Reason::IoError,
             Reason::InvalidStore,

@@ -80,6 +80,9 @@ fn restore<O: Write, E: Write>(
         Kind::Snapshot => opened
             .store
             .next(&["beavy", "snapshots", "inspect", &entry.id]),
+        Kind::Worktree => opened
+            .store
+            .next(&["beavy", "worktrees", "inspect", &entry.id]),
     };
     if output.mode().format == Format::Json {
         let document = Document::new(Restored {
@@ -105,14 +108,17 @@ struct Emptied<'a> {
     store: StoreView,
 }
 
-/// What emptying the trash destroys, such as `2 snapshots`.
+/// What emptying the trash destroys, such as `2 snapshots and 1 worktree`.
 fn contents(entries: &[TrashEntry]) -> String {
     let count = |kind| entries.iter().filter(|e| e.kind == kind).count();
-    let parts: Vec<String> = [(count(Kind::Snapshot), "snapshot", "snapshots")]
-        .into_iter()
-        .filter(|(n, _, _)| *n > 0)
-        .map(|(n, one, many)| format::plural(n, one, many))
-        .collect();
+    let parts: Vec<String> = [
+        (count(Kind::Snapshot), "snapshot", "snapshots"),
+        (count(Kind::Worktree), "worktree", "worktrees"),
+    ]
+    .into_iter()
+    .filter(|(n, _, _)| *n > 0)
+    .map(|(n, one, many)| format::plural(n, one, many))
+    .collect();
     if parts.is_empty() {
         "nothing".into()
     } else {

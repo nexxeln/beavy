@@ -1,6 +1,7 @@
-//! The trash. Deleting a snapshot moves it here with one rename, so deletion is
-//! instant whatever the size of the data, and restorable until the trash is
-//! emptied. Layers stay in layers/ while any snapshot, live or trashed, uses them.
+//! The trash. Deleting a snapshot or worktree moves it here with one rename, so
+//! deletion is instant whatever the size of the data, and restorable until the
+//! trash is emptied. Layers stay in layers/ while any snapshot, live or trashed,
+//! uses them.
 
 use std::fs;
 use std::io::ErrorKind;
@@ -8,31 +9,37 @@ use std::io::ErrorKind;
 use serde::{Deserialize, Serialize};
 
 use super::snapshot::SnapshotRecord;
-use super::{FORMAT, SNAPSHOTS, Store, TRASH, fs_error, list_dir, read_record, write_record};
+use super::{
+    FORMAT, SNAPSHOTS, Store, TRASH, WORKTREES, fs_error, list_dir, read_record, write_record,
+};
 use crate::envelope::Warning;
 use crate::error::{Error, Reason};
 use crate::time;
 
 const ENTRY_FILE: &str = "entry.json";
 pub(crate) const SNAPSHOT_FILE: &str = "snapshot.json";
+const WORKTREE_DIR: &str = "worktree";
 
 /// What a trash entry holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     Snapshot,
+    Worktree,
 }
 
 impl Kind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Kind::Snapshot => "snapshot",
+            Kind::Worktree => "worktree",
         }
     }
 
     const fn payload(self) -> &'static str {
         match self {
             Kind::Snapshot => SNAPSHOT_FILE,
+            Kind::Worktree => WORKTREE_DIR,
         }
     }
 }
@@ -47,7 +54,7 @@ struct EntryRecord {
     deleted_at: String,
 }
 
-/// A deleted snapshot that can still be restored.
+/// A deleted snapshot or worktree that can still be restored.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrashEntry {
@@ -94,8 +101,8 @@ impl Store {
             .collect())
     }
 
-    /// Move a snapshot into the trash. `payload` is the record to move. Needs the
-    /// store lock.
+    /// Move a snapshot or worktree into the trash. `payload` is the record or
+    /// directory to move. Needs the store lock.
     pub(crate) fn move_to_trash(
         &self,
         _guard: &super::Guard,
@@ -125,7 +132,7 @@ impl Store {
             .map_err(|err| fs_error(err, format!("move {} to the trash", payload.display())))
     }
 
-    /// Put a trashed snapshot back.
+    /// Put a trashed snapshot or worktree back.
     pub fn restore(&self, id: &str) -> Result<Restored, Error> {
         if !self.exists()? {
             return Err(self.trash_not_found(id));
@@ -153,6 +160,42 @@ impl Store {
                     }
                 }
                 let target = self.join(SNAPSHOTS).join(format!("{}.json", record.id));
+                fs::rename(&payload, &target)
+                    .map_err(|err| fs_error(err, format!("restore {}", target.display())))?;
+            }
+            Kind::Worktree => {
+                let live = self.worktree_records()?;
+                if let Some(name) = &record.name
+                    && let Some(taken) = live.iter().find(|r| r.name.as_ref() == Some(name))
+                {
+                    return Err(Error::new(
+                        Reason::NameTaken,
+                        format!(
+                            "Can't restore worktree {}. Worktree {} has its name {name} now.",
+                            record.id, taken.id
+                        ),
+                    ));
+                }
+                let worktree: Option<super::worktree::WorktreeRecord> =
+                    read_record(&payload.join("worktree.json"))?;
+                let snapshot = worktree.map(|w| w.snapshot).unwrap_or_default();
+                if !self.snapshot_records()?.iter().any(|s| s.id == snapshot) {
+                    let mut error = Error::new(
+                        Reason::NotFound,
+                        format!(
+                            "Can't restore worktree {}. Its snapshot {snapshot} isn't in the store.",
+                            record.id
+                        ),
+                    );
+                    if self.trash_records()?.iter().any(|r| r.id == snapshot) {
+                        error = error.with_next(
+                            "Restore its snapshot first",
+                            self.next(&["beavy", "trash", "restore", &snapshot]),
+                        );
+                    }
+                    return Err(error);
+                }
+                let target = self.join(WORKTREES).join(&record.id);
                 fs::rename(&payload, &target)
                     .map_err(|err| fs_error(err, format!("restore {}", target.display())))?;
             }

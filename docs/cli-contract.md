@@ -115,14 +115,15 @@ On failure with `--json`, stderr gets one line:
 | `unknown_command` | Usage | 2 | `error` | A command path segment doesn't exist |
 | `missing_argument` | Missing input | 2 | `action_required` | Required input is missing and the run can't prompt for it |
 | `confirmation_required` | Missing input | 2 | `action_required` | A command that destroys data needs `--yes` in a non-interactive run |
-| `not_found` | Not found | 1 | `error` | A named file, directory, snapshot, or trash entry doesn't exist |
+| `not_found` | Not found | 1 | `error` | A named file, directory, snapshot, worktree, trash entry, or command doesn't exist |
 | `permission_denied` | Permission | 1 | `error` | The process isn't allowed to read or change what was named |
-| `name_taken` | Conflict | 1 | `error` | Another snapshot in the store has the name |
-| `snapshot_in_use` | Conflict | 1 | `error` | A snapshot can't be deleted while another snapshot was made from it |
+| `name_taken` | Conflict | 1 | `error` | Another snapshot or worktree in the store has the name |
+| `snapshot_in_use` | Conflict | 1 | `error` | A snapshot can't be deleted while another snapshot was made from it or a worktree uses it |
+| `worktree_in_use` | Conflict | 1 | `error` | A worktree can't be sealed, mounted, unmounted, or deleted while commands run in it or files are open in its mount |
 | `unsupported_git_state` | Conflict | 1 | `error` | The project is a linked Git worktree or submodule, or its repository is in the middle of a merge, rebase, cherry-pick, revert, or bisect |
 | `io_error` | System | 1 | `error` | The operating system failed a read or write |
 | `invalid_store` | System | 1 | `error` | The store has a layout version this beavy can't read, or a damaged record |
-| `backend_unavailable` | System | 1 | `error` | This platform can't keep snapshots yet: beavy's store only runs on Linux |
+| `backend_unavailable` | System | 1 | `error` | This machine can't mount worktrees: no overlayfs, neither root nor user namespaces, or a platform other than Linux. `next` names the fix when beavy can tell it |
 | `internal_error` | Internal | 1 | `error` | A bug in beavy |
 | `canceled` | Canceled | 130 | `error` | The user declined a confirmation; nothing changed |
 
@@ -135,6 +136,8 @@ to `error::Reason` in the same change.
 | --- | --- |
 | `cleanup_failed` | A temporary file or directory beavy created couldn't be removed. The message names the path |
 | `entries_skipped` | An import left out entries it can't copy: sockets, and device nodes when beavy isn't root. The message names them |
+| `store_on_overlayfs` | The store is on overlayfs, such as a container's root filesystem. Worktrees stack another overlay on it, which some kernels refuse and every kernel slows down |
+| `remount_failed` | A sealed worktree couldn't be mounted again at the directory it was mounted on before |
 
 ## Human output
 
@@ -315,10 +318,11 @@ A snapshot object:
 | --- | --- | --- |
 | `id` | string | `snap_` and 10 characters |
 | `name` | string or null | |
-| `parent` | string or null | The snapshot this one was made from; null for an import |
-| `source` | string | The directory the chain's base was imported from |
+| `parent` | string or null | The snapshot a sealed one was made from; null for an import |
+| `source` | string | The directory the chain's base was imported from. Worktrees run there |
 | `commit` | string or null | The Git commit checked out when the snapshot was taken |
-| `method` | `"copy"` or `"reflink"` | How the top layer was made |
+| `method` | `"copy"`, `"reflink"`, or `"seal"` | How the top layer was made |
+| `worktree` | string or null | The worktree a sealed snapshot came from |
 | `depth` | integer | Layers in the chain, the base included |
 | `createdAt` | string | RFC 3339 UTC time |
 | `children` | array of strings | Snapshots whose parent is this one |

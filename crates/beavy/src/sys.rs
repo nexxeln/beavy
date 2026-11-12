@@ -14,6 +14,7 @@ pub(crate) const STAGE_MAP: u8 = 2;
 pub(crate) const STAGE_CHDIR: u8 = 3;
 pub(crate) const STAGE_PRIVATE: u8 = 4;
 pub(crate) const STAGE_MOUNT: u8 = 5;
+pub(crate) const STAGE_JOIN: u8 = 6;
 
 pub(crate) fn errno() -> i32 {
     io::Error::last_os_error().raw_os_error().unwrap_or(0)
@@ -46,6 +47,12 @@ impl IdMaps {
     /// Map this process's IDs to root in the namespace.
     pub(crate) fn to_root() -> Self {
         Self::mapping(|_| 0)
+    }
+
+    /// Map this process's IDs to themselves, so a command in the namespace sees
+    /// the caller's real user and group.
+    pub(crate) fn identity() -> Self {
+        Self::mapping(|id| id)
     }
 
     fn mapping(inside: impl Fn(u32) -> u32) -> Self {

@@ -27,7 +27,7 @@ pub(super) fn os_version(kernel: Option<&str>) -> Option<String> {
 /// The filesystem type of `path`, from the mount table entry whose device matches
 /// the path's device, falling back to statfs magic numbers that name exactly one
 /// filesystem.
-pub(super) fn filesystem_type(path: &Path) -> Option<String> {
+pub(crate) fn filesystem_type(path: &Path) -> Option<String> {
     let dev = fs::metadata(path).ok()?.dev();
     let (major, minor) = (
         ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff),
