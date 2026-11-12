@@ -305,12 +305,17 @@ impl Store {
         if !self.exists()? {
             return Err(self.worktree_not_found(selector));
         }
-        let (guard, warnings) = self.open_for_change()?;
+        let (guard, mut warnings) = self.open_for_change()?;
         let record = self.find_worktree(selector)?;
         let _entering = self.lock_worktree(&record.id)?;
         let worktree = self.fresh_view(&record)?;
         self.ensure_idle(&worktree)?;
         self.unmount_all(&worktree)?;
+        if let Err(err) = self.ensure_unheld(&worktree) {
+            let layers = self.snapshot_of(&record)?.layers;
+            self.remount(&record.id, &layers, &worktree.mounts, &mut warnings);
+            return Err(err);
+        }
         let dir = self.join(WORKTREES).join(&record.id);
         self.move_to_trash(
             &guard,
@@ -418,6 +423,7 @@ impl Store {
             ));
         }
         self.ensure_idle(&worktree)?;
+        self.ensure_unheld(&worktree)?;
         let snapshot = self.snapshot_of(&record)?;
         let spec = self.spec(&snapshot.layers, &Path::new(WORKTREES).join(&record.id))?;
         overlay::mount_persistent(&spec, &point)
@@ -514,14 +520,24 @@ impl Store {
             .filter(|cwd| cwd.starts_with(&target))
             .unwrap_or_else(|| target.clone());
         let source = self.worktree_source(&record.id);
-        let live = self.live_runs(&record.id, true);
         let table = overlay::mounts(None).unwrap_or_default();
         let entry = if let Some(point) = overlay::mounts_of(&table, &source).first() {
             Entry::Bind(c_path(point)?)
-        } else if live.is_empty() {
-            Entry::Mount(self.spec(&snapshot.layers, &Path::new(WORKTREES).join(&record.id))?)
         } else {
-            self.join_run(&record.id, &live, &target, &source)?
+            let holders = overlay::holders(&source, Some(&target));
+            let mut candidates = self.live_runs(&record.id, true);
+            for pid in &holders {
+                if !candidates.contains(pid) {
+                    candidates.push(*pid);
+                }
+            }
+            match self.join_run(&record.id, &candidates, &target, &source) {
+                Ok(entry) => entry,
+                Err(_) if holders.is_empty() => Entry::Mount(
+                    self.spec(&snapshot.layers, &Path::new(WORKTREES).join(&record.id))?,
+                ),
+                Err(err) => return Err(err),
+            }
         };
 
         let runs = self.join(WORKTREES).join(&record.id).join(RUNS);
@@ -623,6 +639,7 @@ impl Store {
         name: Option<&str>,
         warnings: &mut Vec<Warning>,
     ) -> Result<(SealRecord, bool), Error> {
+        self.ensure_unheld(worktree)?;
         let dir = self.join(WORKTREES).join(&worktree.id);
         let upper = dir.join(UPPER);
         let layer = random_id();
@@ -827,16 +844,26 @@ impl Store {
             .find(|snapshot| snapshot.id == record.snapshot)
             .map(|snapshot| snapshot.source.clone())
             .unwrap_or_default();
+        let source = self.worktree_source(&record.id);
+        let mut runs = self.live_runs(&record.id, false);
+        if !path.is_empty() {
+            for pid in overlay::holders(&source, Some(Path::new(&path))) {
+                if !runs.contains(&pid) {
+                    runs.push(pid);
+                }
+            }
+            runs.sort_unstable();
+        }
         Worktree {
             id: record.id.clone(),
             name: record.name.clone(),
             snapshot: record.snapshot.clone(),
             path,
-            mounts: overlay::mounts_of(table, &self.worktree_source(&record.id))
+            mounts: overlay::mounts_of(table, &source)
                 .iter()
                 .map(|point| point.to_string_lossy().into_owned())
                 .collect(),
-            runs: self.live_runs(&record.id, false),
+            runs,
             created_at: record.created_at.clone(),
         }
     }
@@ -1059,6 +1086,34 @@ impl Store {
                 "Can't change worktree {} while commands run in it (process {}).",
                 worktree.id,
                 live.iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )
+        .with_next(
+            "See what's running in it",
+            self.next(&["beavy", "worktrees", "inspect", &worktree.id]),
+        ))
+    }
+
+    /// Refuse while any process, in any mount namespace beavy can see, still has
+    /// the worktree mounted: a command that dropped its run's lock, or something it
+    /// started in the background, could otherwise keep writing to the upper layer
+    /// after it's sealed or deleted. Call it once the worktree's own mounts are
+    /// unmounted, so only other namespaces' mounts are left to find.
+    fn ensure_unheld(&self, worktree: &Worktree) -> Result<(), Error> {
+        let holders = overlay::holders(&self.worktree_source(&worktree.id), None);
+        if holders.is_empty() {
+            return Ok(());
+        }
+        Err(Error::new(
+            Reason::WorktreeInUse,
+            format!(
+                "Can't change worktree {} while processes still have it mounted (process {}). They were started in it and could still write to it.",
+                worktree.id,
+                holders
+                    .iter()
                     .map(u32::to_string)
                     .collect::<Vec<_>>()
                     .join(", ")

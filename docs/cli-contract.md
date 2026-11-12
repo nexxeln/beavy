@@ -123,7 +123,7 @@ On failure with `--json`, stderr gets one line:
 | `permission_denied` | Permission | 1 | `error` | The process isn't allowed to read or change what was named, or beavy won't use the store: it belongs to another user, other users can write to it, or, as root, another user could replace it |
 | `name_taken` | Conflict | 1 | `error` | Another snapshot or worktree in the store has the name |
 | `snapshot_in_use` | Conflict | 1 | `error` | A snapshot can't be deleted while another snapshot was made from it or a worktree uses it |
-| `worktree_in_use` | Conflict | 1 | `error` | A worktree can't be sealed, mounted, unmounted, or deleted while commands run in it or files are open in its mount |
+| `worktree_in_use` | Conflict | 1 | `error` | A worktree can't be sealed, mounted, unmounted, or deleted while commands run in it, processes they started still have it mounted, or files are open in its mount. The message names the processes |
 | `unsupported_git_state` | Conflict | 1 | `error` | The project is a linked Git worktree or submodule, or its repository is in the middle of a merge, rebase, cherry-pick, revert, or bisect |
 | `io_error` | System | 1 | `error` | The operating system failed a read or write |
 | `invalid_store` | System | 1 | `error` | The store has a layout version this beavy can't read, or a damaged record, such as one whose ID isn't an ID |
@@ -341,9 +341,9 @@ upper layer, so what it shows doesn't change. If the chain would be deeper than 
 layers, beavy merges every layer above the base into one first (see
 [the design](design/worktrees.md#squashing)). A persistent mount is unmounted for
 the seal and mounted again afterwards; failing that is a `remount_failed` warning.
-Sealing fails with `worktree_in_use` while commands run in the worktree. A
-record or seal journal that fails beavy's checks fails the command with
-`invalid_store`.
+Sealing fails with `worktree_in_use` while commands run in the worktree or
+processes they started still have it mounted, and names them. A record or seal
+journal that fails beavy's checks fails the command with `invalid_store`.
 
 A name is 1 to 63 lowercase letters, digits, and hyphens, starting and ending with a
 letter or digit, and unique among the store's snapshots (`name_taken`). The
@@ -460,7 +460,7 @@ A worktree object:
 | `snapshot` | string | The snapshot under the worktree's changes: the one it was created from, or last sealed into |
 | `path` | string | The directory the worktree covers while a command runs in it: its snapshot's `source` |
 | `mounts` | array of strings | Directories where it's mounted for every process |
-| `runs` | array of integers | Process IDs of commands running in it |
+| `runs` | array of integers | Process IDs of commands running in it, and of processes they started that still have it mounted |
 | `createdAt` | string | RFC 3339 UTC time |
 
 A backend object is `{ "name": "overlayfs", "privilege": "root" }` or
@@ -508,8 +508,9 @@ unknown worktree or command, `backend_unavailable` when the mount fails,
 `permission_denied` when the command can't run as the user who ran sudo.
 
 Commands in one worktree may run at the same time. The first mounts the worktree
-and later ones join its mount namespace, so a worktree is never mounted twice. A
-worktree with a persistent mount is bound from that mount.
+and later ones join the mount namespace of a process that has it mounted: a
+command still running in it, or one it started in the background. A worktree is
+never mounted twice. A worktree with a persistent mount is bound from that mount.
 
 ### beavy worktrees mount
 
@@ -543,7 +544,8 @@ beavy worktrees delete <WORKTREE> [--store <DIR>] [--json]
 
 Unmounts the worktree if it's mounted and moves it to the trash in one rename,
 whatever its size; `beavy trash restore` brings it back until the trash is emptied.
-Fails with `worktree_in_use` while commands run in it. Result:
+Fails with `worktree_in_use` while commands run in it or processes they started
+still have it mounted. Result:
 `{ "worktree": <worktree>, "outcome": "deleted", "store": { "path": "..." } }`.
 
 ## Changing the contract

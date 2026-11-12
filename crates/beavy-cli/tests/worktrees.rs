@@ -232,6 +232,17 @@ fn sudo_user() -> Option<(u32, u32)> {
     (unsafe { libc::geteuid() } == 0).then_some((65534, 65534))
 }
 
+/// Kill a process and wait until it no longer holds any mount.
+fn stop(pid: &str) {
+    Command::new("kill").args(["-KILL", pid]).status().unwrap();
+    let start = Instant::now();
+    while fs::read_to_string(format!("/proc/{pid}/mountinfo")).is_ok_and(|table| !table.is_empty())
+    {
+        assert!(start.elapsed() < Duration::from_secs(10), "{pid} lives on");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Every path under `root`, `root` included.
 fn walk(root: &Path) -> Vec<PathBuf> {
     let mut paths = vec![root.to_path_buf()];
@@ -617,6 +628,47 @@ fn root_mounts_a_worktree_for_every_process() {
     f.ok(&["worktrees", "mount", &wt, dir.to_str().unwrap()]);
     f.ok(&["worktrees", "delete", &wt]);
     assert!(!dir.join("from-run").exists());
+}
+
+#[test]
+fn background_jobs_never_block_later_runs_or_outlive_a_seal() {
+    let Some(f) = Fixture::new() else { return };
+    let wt = f.create("base");
+
+    let job = f.sh(&wt, "sleep 60 >/dev/null 2>&1 & echo $!");
+    let job = job.trim();
+    let namespaces = f.sh(
+        &wt,
+        &format!("readlink /proc/{job}/ns/mnt; readlink /proc/self/ns/mnt"),
+    );
+    let namespaces: Vec<&str> = namespaces.lines().collect();
+    assert_eq!(namespaces.len(), 2);
+    assert_eq!(namespaces[0], namespaces[1], "a later run joins the job");
+    stop(job);
+
+    let job = f.sh(
+        &wt,
+        "python3 -c 'import subprocess; print(subprocess.Popen([\"sleep\", \"60\"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).pid)'",
+    );
+    let job = job.trim();
+    let runs = f.json(&["worktrees", "inspect", &wt])["worktree"]["runs"].clone();
+    assert!(
+        runs.as_array()
+            .unwrap()
+            .iter()
+            .any(|run| run.as_u64().is_some_and(|pid| pid.to_string() == job)),
+        "{runs}"
+    );
+    for args in [
+        &["snapshots", "create", "--worktree", &wt, "--json"][..],
+        &["worktrees", "delete", &wt, "--json"],
+    ] {
+        let error = refuse(f.beavy(args));
+        assert_eq!(error["reason"], "worktree_in_use");
+        assert!(error["message"].as_str().unwrap().contains(job), "{error}");
+    }
+    stop(job);
+    f.ok(&["snapshots", "create", "--worktree", &wt]);
 }
 
 #[test]

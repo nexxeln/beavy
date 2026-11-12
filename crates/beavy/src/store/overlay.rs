@@ -8,11 +8,13 @@
 //! two modes, and it turns off redirects and metacopy, so every layer holds whole
 //! files and stands on its own.
 
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, OsString};
 use std::fs;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use rustix::process::Gid;
@@ -114,6 +116,8 @@ pub(crate) fn c_path(path: &Path) -> Result<CString, Error> {
 /// One line of a mount table.
 #[derive(Debug, Clone)]
 pub(crate) struct Mount {
+    /// Unique among the mounts of every namespace.
+    pub id: u64,
     pub point: PathBuf,
     pub fstype: String,
     pub source: OsString,
@@ -132,12 +136,18 @@ pub(crate) fn mounts(pid: Option<u32>) -> io::Result<Vec<Mount>> {
         let Some(dash) = fields.iter().position(|field| *field == b"-") else {
             continue;
         };
-        let (Some(point), Some(fstype), Some(source)) =
-            (fields.get(4), fields.get(dash + 1), fields.get(dash + 2))
-        else {
+        let (Some(id), Some(point), Some(fstype), Some(source)) = (
+            fields
+                .first()
+                .and_then(|id| std::str::from_utf8(id).ok()?.parse().ok()),
+            fields.get(4),
+            fields.get(dash + 1),
+            fields.get(dash + 2),
+        ) else {
             continue;
         };
         mounts.push(Mount {
+            id,
             point: PathBuf::from(OsString::from_vec(unescape(point))),
             fstype: String::from_utf8_lossy(fstype).into_owned(),
             source: OsString::from_vec(unescape(source)),
@@ -177,6 +187,57 @@ pub(crate) fn mounts_of(table: &[Mount], source: &Path) -> Vec<PathBuf> {
         .filter(|mount| mount.fstype == "overlay" && Path::new(&mount.source) == source)
         .map(|mount| mount.point.clone())
         .collect()
+}
+
+/// Processes outside this mount namespace with an overlay mount whose source is
+/// `source`, a worktree directory: commands running in the worktree, and anything
+/// they started that is still there, whether or not it kept the run's lock. With
+/// `at`, only mounts on that directory count. A process beavy can't read is
+/// missed, so run this as root to see every namespace.
+pub(crate) fn holders(source: &Path, at: Option<&Path>) -> Vec<u32> {
+    let wanted = |mount: &Mount| mount.fstype == "overlay" && Path::new(&mount.source) == source;
+    let own: HashSet<u64> = mounts(None)
+        .unwrap_or_default()
+        .iter()
+        .filter(|mount| wanted(mount))
+        .map(|mount| mount.id)
+        .collect();
+    let me = std::process::id();
+    let mut namespaces: HashMap<u64, bool> = HashMap::new();
+    let mut pids = Vec::new();
+    for entry in fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        let namespace = fs::metadata(format!("/proc/{pid}/ns/mnt"))
+            .ok()
+            .map(|metadata| metadata.ino());
+        let known = namespace.and_then(|namespace| namespaces.get(&namespace).copied());
+        let holds = known.unwrap_or_else(|| {
+            let holds = mounts(Some(pid)).is_ok_and(|table| {
+                table.iter().any(|mount| {
+                    wanted(mount)
+                        && !own.contains(&mount.id)
+                        && at.is_none_or(|at| mount.point == at)
+                })
+            });
+            if let Some(namespace) = namespace {
+                namespaces.insert(namespace, holds);
+            }
+            holds
+        });
+        if holds {
+            pids.push(pid);
+        }
+    }
+    pids
 }
 
 /// A directory beavy opened and checked before fork. A descriptor belongs to the
