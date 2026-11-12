@@ -188,57 +188,76 @@ pub(crate) fn mounts_of(table: &[Mount], source: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Processes outside this mount namespace with an overlay mount whose source is
-/// `source`, a worktree directory: commands running in the worktree, and anything
-/// they started that is still there, whether or not it kept the run's lock. With
-/// `at`, only mounts on that directory count. Each namespace's table is read
-/// once. Anyone may read a process's mount table, so only a process that /proc
-/// hides from beavy, with `hidepid`, is missed.
-pub(crate) fn holders(source: &Path, at: Option<&Path>) -> Vec<u32> {
-    let wanted = |mount: &Mount| mount.fstype == "overlay" && Path::new(&mount.source) == source;
-    let own: HashSet<u64> = mounts(None)
-        .unwrap_or_default()
-        .iter()
-        .filter(|mount| wanted(mount))
-        .map(|mount| mount.id)
-        .collect();
-    let me = std::process::id();
-    let mut namespaces: HashMap<u64, bool> = HashMap::new();
-    let mut pids = Vec::new();
-    for entry in fs::read_dir("/proc").into_iter().flatten().flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        if pid == me {
-            continue;
-        }
-        let Some(namespace) = first_mount(pid) else {
-            continue;
-        };
-        let holds = match namespaces.get(&namespace) {
-            Some(holds) => *holds,
-            None => {
-                let Ok(table) = mounts(Some(pid)) else {
-                    continue;
-                };
-                let holds = table.iter().any(|mount| {
-                    wanted(mount)
-                        && !own.contains(&mount.id)
-                        && at.is_none_or(|at| mount.point == at)
-                });
-                namespaces.insert(namespace, holds);
-                holds
+/// The other mount namespaces of the machine, as one pass over /proc found them:
+/// the overlay mounts each has that this namespace doesn't, and the processes in
+/// each. Each namespace's table is read once. Anyone may read a process's mount
+/// table, so only a process that /proc hides from beavy, with `hidepid`, is missed.
+#[derive(Default)]
+pub(crate) struct Namespaces {
+    overlays: Vec<Vec<Mount>>,
+    processes: Vec<(u32, usize)>,
+}
+
+impl Namespaces {
+    pub(crate) fn scan() -> Self {
+        let own: HashSet<u64> = mounts(None)
+            .unwrap_or_default()
+            .iter()
+            .map(|mount| mount.id)
+            .collect();
+        let me = std::process::id();
+        let mut seen: HashMap<u64, usize> = HashMap::new();
+        let mut namespaces = Self::default();
+        for entry in fs::read_dir("/proc").into_iter().flatten().flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if pid == me {
+                continue;
             }
-        };
-        if holds {
-            pids.push(pid);
+            let Some(first) = first_mount(pid) else {
+                continue;
+            };
+            let index = match seen.get(&first) {
+                Some(index) => *index,
+                None => {
+                    let Ok(table) = mounts(Some(pid)) else {
+                        continue;
+                    };
+                    namespaces.overlays.push(
+                        table
+                            .into_iter()
+                            .filter(|mount| mount.fstype == "overlay" && !own.contains(&mount.id))
+                            .collect(),
+                    );
+                    seen.insert(first, namespaces.overlays.len() - 1);
+                    namespaces.overlays.len() - 1
+                }
+            };
+            namespaces.processes.push((pid, index));
         }
+        namespaces
     }
-    pids
+
+    /// Processes outside this mount namespace with an overlay mount whose source is
+    /// `source`, a worktree directory: commands running in the worktree, and
+    /// anything they started that is still there, whether or not it kept the run's
+    /// lock. With `at`, only mounts on that directory count.
+    pub(crate) fn holders(&self, source: &Path, at: Option<&Path>) -> Vec<u32> {
+        self.processes
+            .iter()
+            .filter(|(_, index)| {
+                self.overlays[*index].iter().any(|mount| {
+                    Path::new(&mount.source) == source && at.is_none_or(|at| mount.point == at)
+                })
+            })
+            .map(|(pid, _)| *pid)
+            .collect()
+    }
 }
 
 /// The ID of the first mount in a process's mount table. A mount belongs to one

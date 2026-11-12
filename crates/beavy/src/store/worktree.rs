@@ -214,9 +214,10 @@ impl Store {
         let records = self.read_worktrees()?;
         let snapshots = self.read_snapshots()?;
         let table = overlay::mounts(None).unwrap_or_default();
+        let namespaces = overlay::Namespaces::scan();
         Ok(records
             .iter()
-            .map(|record| self.view_worktree(record, &snapshots, &table))
+            .map(|record| self.view_worktree(record, &snapshots, &table, &namespaces))
             .collect())
     }
 
@@ -521,10 +522,11 @@ impl Store {
             .unwrap_or_else(|| target.clone());
         let source = self.worktree_source(&record.id);
         let table = overlay::mounts(None).unwrap_or_default();
+        let namespaces = overlay::Namespaces::scan();
         let entry = if let Some(point) = overlay::mounts_of(&table, &source).first() {
             Entry::Bind(c_path(point)?)
         } else {
-            let holders = overlay::holders(&source, Some(&target));
+            let holders = namespaces.holders(&source, Some(&target));
             let mut candidates = self.live_runs(&record.id, true);
             for pid in &holders {
                 if !candidates.contains(pid) {
@@ -578,7 +580,7 @@ impl Store {
         Ok(Prepared {
             command,
             program: program.to_owned(),
-            worktree: self.fresh_view(&record)?,
+            worktree: self.view_worktree(&record, &self.read_snapshots()?, &table, &namespaces),
             privilege,
             store: self.path().to_path_buf(),
             run,
@@ -842,7 +844,8 @@ impl Store {
     fn fresh_view(&self, record: &WorktreeRecord) -> Result<Worktree, Error> {
         let snapshots = self.read_snapshots()?;
         let table = overlay::mounts(None).unwrap_or_default();
-        Ok(self.view_worktree(record, &snapshots, &table))
+        let namespaces = overlay::Namespaces::scan();
+        Ok(self.view_worktree(record, &snapshots, &table, &namespaces))
     }
 
     fn view_worktree(
@@ -850,6 +853,7 @@ impl Store {
         record: &WorktreeRecord,
         snapshots: &[SnapshotRecord],
         table: &[overlay::Mount],
+        namespaces: &overlay::Namespaces,
     ) -> Worktree {
         let path = snapshots
             .iter()
@@ -859,7 +863,7 @@ impl Store {
         let source = self.worktree_source(&record.id);
         let mut runs = self.live_runs(&record.id, false);
         if !path.is_empty() {
-            for pid in overlay::holders(&source, Some(Path::new(&path))) {
+            for pid in namespaces.holders(&source, Some(Path::new(&path))) {
                 if !runs.contains(&pid) {
                     runs.push(pid);
                 }
@@ -1115,7 +1119,8 @@ impl Store {
     /// after it's sealed or deleted. Call it once the worktree's own mounts are
     /// unmounted, so only other namespaces' mounts are left to find.
     fn ensure_unheld(&self, worktree: &Worktree) -> Result<(), Error> {
-        let holders = overlay::holders(&self.worktree_source(&worktree.id), None);
+        let holders =
+            overlay::Namespaces::scan().holders(&self.worktree_source(&worktree.id), None);
         if holders.is_empty() {
             return Ok(());
         }

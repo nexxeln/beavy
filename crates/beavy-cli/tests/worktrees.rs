@@ -673,6 +673,14 @@ fn background_jobs_never_block_later_runs_or_outlive_a_seal() {
             .any(|run| run.as_u64().is_some_and(|pid| pid.to_string() == job)),
         "{runs}"
     );
+    let listed = f.json(&["worktrees", "list"]);
+    let listed = listed["worktrees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|worktree| worktree["id"] == wt.as_str())
+        .unwrap();
+    assert_eq!(listed["runs"], runs);
     for args in [
         &["snapshots", "create", "--worktree", &wt, "--json"][..],
         &["worktrees", "delete", &wt, "--json"],
