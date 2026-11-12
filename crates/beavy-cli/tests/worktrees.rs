@@ -402,6 +402,13 @@ fn long_chains_are_squashed_without_changing_what_worktrees_see() {
         f.sh(&wt, &script);
         let sealed = f.json(&["snapshots", "create", "--worktree", &wt]);
         depths.push(sealed["snapshot"]["depth"].as_u64().unwrap());
+        if sealed["squashed"] == true {
+            let squashed = sealed["snapshot"]["id"].as_str().unwrap();
+            let seen = "ls made; ls -d f*";
+            let expected = format!("m{}\nm{i}\nf{}\nf{i}\n", i - 1, i - 1);
+            assert_eq!(f.sh(&wt, seen), expected);
+            assert_eq!(f.sh(&f.create(squashed), seen), expected);
+        }
     }
     assert_eq!(depths, [2, 3, 4, 5, 6, 7, 8, 2, 3, 4]);
     let expected = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\nf10\nf9\nn\nm10\nm9\n";
