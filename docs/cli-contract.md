@@ -330,8 +330,11 @@ file keeps the owner and mode of the file it actually read. It skips sockets and
 device nodes with an `entries_skipped` warning.
 The project itself is only read, and never becomes part of a mount. In the copy,
 Git's HEAD is detached at the current commit, with the index and working tree as
-they were. A linked Git worktree or submodule fails with `unsupported_git_state`
-and a next command for the main working tree. A repository in the middle of a
+they were. When git is installed and the repository belongs to the user beavy
+works as, beavy runs `git update-index --refresh` in the copy as that user, so the
+index's file stats match the copied files and the first git command in a worktree
+doesn't read every file again. A linked Git worktree or submodule fails with
+`unsupported_git_state` and a next command for the main working tree. A repository in the middle of a
 merge, rebase, cherry-pick, revert, or bisect, or locked by a running git, fails
 the same way.
 

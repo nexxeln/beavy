@@ -180,6 +180,7 @@ impl Store {
             git::detach(scratch.dir(), commit).map_err(|err| {
                 fs_error(err, format!("detach HEAD in {}", scratch.path().display()))
             })?;
+            git::refresh_index(&directory, scratch.path());
         }
         sync_data(scratch.dir(), scratch.path())?;
         let record = SnapshotRecord {

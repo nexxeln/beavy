@@ -235,6 +235,25 @@ fn the_default_store_is_per_project_and_outside_it() {
 }
 
 #[test]
+fn the_imported_index_already_matches_the_copied_files() {
+    let f = Fixture::new();
+    f.git(&["init", "-q"]);
+    f.git(&["add", "-A"]);
+    f.git(&["commit", "-qm", "init"]);
+    fs::write(f.project.join("README.md"), "edited\n").unwrap();
+    f.ok(&["snapshots", "create"]);
+    let layer = f.store.join("layers").join(&f.entries("layers")[0]);
+    let changed = Command::new("git")
+        .arg("-C")
+        .arg(&layer)
+        .args(["diff-files", "--name-only"])
+        .output()
+        .unwrap();
+    assert!(changed.status.success());
+    assert_eq!(String::from_utf8(changed.stdout).unwrap(), "README.md\n");
+}
+
+#[test]
 fn git_state_is_kept_with_a_detached_head_and_unsafe_states_are_refused() {
     let f = Fixture::new();
     f.git(&["init", "-q"]);

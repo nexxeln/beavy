@@ -1,14 +1,18 @@
-//! What beavy reads and writes in a Git working tree, without running git: the
-//! commit a snapshot was taken at, the states it refuses to import, and the
-//! detached HEAD it leaves in the imported copy.
+//! What beavy reads and writes in a Git working tree: the commit a snapshot was
+//! taken at, the states it refuses to import, the detached HEAD it leaves in the
+//! imported copy, and the copy's index, which git itself refreshes.
 
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use rustix::fs::{FileType, Mode, OFlags};
 
-use super::at;
+use super::{at, owner};
 use crate::error::{Error, Next, Reason};
 
 /// Refuse to import a directory whose Git state a copy would get wrong: a linked
@@ -165,6 +169,51 @@ pub(crate) fn detach(tree: &File, commit: &str) -> io::Result<()> {
         let _ = rustix::fs::unlinkat(&git, temporary.as_str(), rustix::fs::AtFlags::empty());
     }
     result
+}
+
+/// Bring the index of `copy`, a fresh import of `source`, up to date with the
+/// copy's files. A copy has new inode numbers and change times, so without this the
+/// first git command in every worktree reads every tracked file again. Runs
+/// `git update-index --refresh` as the store's owner, and only when the source's
+/// repository belongs to that owner, the same repositories git itself trusts. Best
+/// effort: without git, or when it fails, the copy keeps the index it was copied
+/// with.
+pub(crate) fn refresh_index(source: &Path, copy: &Path) {
+    let acting = owner::acting();
+    let uid = acting
+        .as_ref()
+        .map_or_else(|| rustix::process::geteuid().as_raw(), |user| user.uid);
+    if !fs::symlink_metadata(source.join(".git")).is_ok_and(|git| git.is_dir() && git.uid() == uid)
+    {
+        return;
+    }
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(copy)
+        .args(["-c", "core.fsmonitor=false"])
+        .args(["update-index", "-q", "--ignore-submodules", "--refresh"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    for (name, _) in std::env::vars_os() {
+        if name.as_bytes().starts_with(b"GIT_") {
+            command.env_remove(name);
+        }
+    }
+    if let Some(user) = acting {
+        if let Some(home) = owner::home_of(user.uid) {
+            command.env("HOME", home);
+        }
+        let groups = owner::groups_of(&user);
+        // SAFETY: become_user makes only async-signal-safe calls.
+        unsafe {
+            command.pre_exec(move || {
+                owner::become_user(&user, &groups).map_err(io::Error::from_raw_os_error)
+            });
+        }
+    }
+    let _ = command.status();
 }
 
 fn is_hash(text: &str) -> bool {

@@ -42,6 +42,23 @@ pub(crate) fn acting_uid() -> Option<u32> {
     (privileged() && uid != 0).then_some(uid)
 }
 
+/// The user this thread acts as, with its groups, when beavy is root acting as
+/// another user.
+pub(crate) fn acting() -> Option<Identity> {
+    let uid = acting_uid()?;
+    // SAFETY: setfsgid with an invalid ID changes nothing and returns the current one.
+    let gid = unsafe { libc::setfsgid(u32::MAX) } as u32;
+    let groups = rustix::process::getgroups()
+        .map(|groups| groups.iter().map(|gid| gid.as_raw()).collect())
+        .unwrap_or_else(|_| vec![gid]);
+    Some(Identity { uid, gid, groups })
+}
+
+/// A user's home directory, from the password database.
+pub(crate) fn home_of(uid: u32) -> Option<PathBuf> {
+    account(uid).map(|account| account.home)
+}
+
 /// Whether file access on this thread is root's: beavy is root and isn't acting as
 /// another user.
 pub(crate) fn acting_as_root() -> bool {
