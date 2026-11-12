@@ -4,6 +4,7 @@
 #![cfg(target_os = "linux")]
 
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -43,8 +44,32 @@ impl Fixture {
             .env("BEAVY_STORE", &self.store)
             .env_remove("XDG_DATA_HOME")
             .env_remove("__BEAVY_CRASH_AT")
+            .env_remove("SUDO_UID")
+            .env_remove("SUDO_GID")
+            .env_remove("SUDO_USER")
             .stdin(Stdio::null());
         command
+    }
+
+    /// beavy as root through sudo, run by `uid`.
+    fn sudo(&self, args: &[&str], (uid, gid): (u32, u32)) -> Command {
+        let mut command = self.beavy(args);
+        command
+            .env("SUDO_UID", uid.to_string())
+            .env("SUDO_GID", gid.to_string());
+        command
+    }
+
+    /// Hand everything in the fixture to `uid`, as if that user had made it.
+    fn give_to(&self, (uid, gid): (u32, u32)) {
+        let root = self.home.parent().unwrap();
+        let status = Command::new("chown")
+            .arg("-R")
+            .arg(format!("{uid}:{gid}"))
+            .arg(root)
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     fn output(&self, args: &[&str]) -> Output {
@@ -91,6 +116,28 @@ impl Fixture {
 fn error(output: &Output) -> Value {
     assert!(output.stdout.is_empty());
     serde_json::from_slice(&output.stderr).expect("one JSON error")
+}
+
+/// When the tests run as root, the user that stands in for the one who ran sudo.
+fn sudo_user() -> Option<(u32, u32)> {
+    // SAFETY: geteuid has no preconditions.
+    (unsafe { libc::geteuid() } == 0).then_some((65534, 65534))
+}
+
+/// Every path under `root`, `root` included.
+fn walk(root: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![root.to_path_buf()];
+    let mut next = 0;
+    while next < paths.len() {
+        let path = paths[next].clone();
+        next += 1;
+        if fs::symlink_metadata(&path).unwrap().is_dir() {
+            for entry in fs::read_dir(&path).unwrap() {
+                paths.push(entry.unwrap().path());
+            }
+        }
+    }
+    paths
 }
 
 #[test]
@@ -339,6 +386,81 @@ fn a_symlinked_head_is_never_written_through() {
         fs::read_to_string(other.join("HEAD")).unwrap(),
         "ref: refs/heads/main\n"
     );
+}
+
+#[test]
+fn through_sudo_the_store_belongs_to_the_user_who_ran_it() {
+    let Some(user) = sudo_user() else {
+        return;
+    };
+    let f = Fixture::new();
+    f.give_to(user);
+    let created = f
+        .sudo(&["snapshots", "create"], user)
+        .env_remove("BEAVY_STORE")
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let local = f.home.join(".local");
+    let store = walk(&local);
+    assert!(store.len() > 8, "{store:?}");
+    for path in store {
+        let owner = fs::symlink_metadata(&path).unwrap().uid();
+        assert_eq!(owner, user.0, "{}", path.display());
+    }
+
+    let refused = f.output(&["snapshots", "create", "--json"]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert_eq!(error(&refused)["reason"], "permission_denied");
+
+    let dir = tempfile::tempdir().unwrap();
+    let rooted = dir.path().join("store");
+    let rooted = rooted.to_str().unwrap();
+    assert!(
+        f.output(&["snapshots", "create", "--store", rooted])
+            .status
+            .success()
+    );
+    let refused = f
+        .sudo(&["snapshots", "list", "--store", rooted, "--json"], user)
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(1));
+    assert_eq!(error(&refused)["reason"], "permission_denied");
+}
+
+#[test]
+fn through_sudo_beavy_never_follows_a_link_in_the_store() {
+    let Some(user) = sudo_user() else {
+        return;
+    };
+    let f = Fixture::new();
+    f.give_to(user);
+    let created = f.sudo(&["snapshots", "create"], user).output().unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let guarded = tempfile::tempdir().unwrap();
+    let proof = guarded.path().join("proof");
+    fs::remove_file(f.store.join("lock")).unwrap();
+    std::os::unix::fs::symlink(&proof, f.store.join("lock")).unwrap();
+    let refused = f.sudo(&["snapshots", "create"], user).output().unwrap();
+    assert!(!refused.status.success());
+    assert!(!proof.exists());
+
+    fs::remove_file(f.store.join("lock")).unwrap();
+    let created = f.output(&["snapshots", "create"]);
+    assert!(created.status.success());
+    for path in walk(&f.store) {
+        let owner = fs::symlink_metadata(&path).unwrap().uid();
+        assert_eq!(owner, user.0, "{}", path.display());
+    }
 }
 
 #[test]

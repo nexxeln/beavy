@@ -84,6 +84,7 @@ pub struct Restored {
 impl Store {
     /// Everything in the trash, most recently deleted first.
     pub fn trash(&self) -> Result<Vec<TrashEntry>, Error> {
+        let _acting = self.act()?;
         if !self.exists()? {
             return Ok(Vec::new());
         }
@@ -127,6 +128,7 @@ impl Store {
 
     /// Put a trashed snapshot back.
     pub fn restore(&self, id: &str) -> Result<Restored, Error> {
+        let _acting = self.act()?;
         if !self.exists()? {
             return Err(self.trash_not_found(id));
         }
@@ -167,6 +169,7 @@ impl Store {
     /// Delete everything in the trash for good, and every layer that no live
     /// snapshot uses.
     pub fn empty_trash(&self) -> Result<Emptied, Error> {
+        let _acting = self.act()?;
         if !self.exists()? {
             return Ok(Emptied {
                 entries: Vec::new(),

@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use rustix::fs::{AtFlags, FileType, Gid, Mode, OFlags, Timespec, Timestamps, Uid};
 
 use super::at::{self, Stat};
-use super::fs_error;
+use super::{fs_error, owner};
 use crate::error::Error;
 
 /// What [`copy`] did.
@@ -52,7 +52,7 @@ pub(crate) fn copy(
     let failed = |err: io::Error, action: &str, path: &Path| {
         fs_error(err, format!("{action} {}", path.display()))
     };
-    let keep_owner = rustix::process::geteuid().is_root();
+    let keep_owner = owner::acting_as_root();
     let source_dir = at::open_dir(source).map_err(|err| failed(err, "read", source))?;
     let mut dirs = vec![Node {
         relative: PathBuf::new(),

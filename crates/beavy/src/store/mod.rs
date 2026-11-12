@@ -15,11 +15,14 @@
 //! everything it names is in place, so a crash leaves either the old state or the
 //! new one, plus leftovers in tmp/ and unreferenced layers. The next command that
 //! changes the store removes those leftovers before it does anything else.
+//!
+//! Every file system call in a store runs as the store's owner (see [`owner`]),
+//! and beavy refuses a store that anyone else can write.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
@@ -33,6 +36,7 @@ use crate::error::{Error, Next, Reason};
 
 mod at;
 mod git;
+mod owner;
 mod snapshot;
 mod trash;
 mod tree;
@@ -103,7 +107,7 @@ pub fn locate(
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .or_else(|| {
-            env("HOME")
+            owner::store_home(env("HOME"))
                 .filter(|home| !home.is_empty())
                 .map(|home| PathBuf::from(home).join(".local/share"))
         });
@@ -286,6 +290,88 @@ impl Store {
         self.root.join(relative)
     }
 
+    /// Act as the store's owner on this thread until the guard drops. Every public
+    /// operation starts here. A store that doesn't exist yet will belong to the
+    /// caller. Refuses a store that users other than its owner can write, a store
+    /// that belongs to someone else unless beavy is root without sudo, and, when
+    /// beavy works as root, a store that another user could move or replace.
+    pub(crate) fn act(&self) -> Result<owner::Acting, Error> {
+        let shown = self.root.display();
+        let caller = owner::caller();
+        let identity = match fs::symlink_metadata(&self.root) {
+            Err(err) if err.kind() == ErrorKind::NotFound => caller,
+            Err(err) => return Err(fs_error(err, format!("read store {shown}"))),
+            Ok(metadata) => {
+                if !metadata.is_dir() {
+                    return Err(Error::new(
+                        Reason::InvalidArguments,
+                        format!("Can't use store {shown}. It isn't a directory."),
+                    ));
+                }
+                if metadata.mode() & 0o022 != 0 {
+                    return Err(Error::new(
+                        Reason::PermissionDenied,
+                        format!(
+                            "Can't use store {shown}. Users other than its owner can write to it."
+                        ),
+                    )
+                    .with_next(
+                        "Make it writable only by its owner",
+                        Next::new(["chmod", "go-w", &shown.to_string()]),
+                    ));
+                }
+                let uid = metadata.uid();
+                if uid == caller.uid {
+                    caller
+                } else if owner::privileged() && owner::sudo_caller().is_none() {
+                    owner::Identity::of(uid, owner::primary_gid(uid).unwrap_or(metadata.gid()))
+                } else {
+                    return Err(Error::new(
+                        Reason::PermissionDenied,
+                        format!(
+                            "Can't use store {shown}. It belongs to {}, and beavy only uses a store as its owner.",
+                            owner::name_of(uid)
+                        ),
+                    ));
+                }
+            }
+        };
+        if identity.uid == 0 && owner::privileged() {
+            self.check_root_path()?;
+        }
+        owner::act_as(&identity).map_err(|err| fs_error(err, format!("use store {shown}")))
+    }
+
+    /// Working as root, refuse a store when a directory on the way to it belongs to
+    /// another user or is writable by others without the sticky bit, because that
+    /// user could replace the store while beavy works in it.
+    fn check_root_path(&self) -> Result<(), Error> {
+        for dir in self.root.ancestors() {
+            let metadata = match fs::symlink_metadata(dir) {
+                Ok(metadata) => metadata,
+                Err(err) if err.kind() == ErrorKind::NotFound => continue,
+                Err(err) => return Err(fs_error(err, format!("read {}", dir.display()))),
+            };
+            let shared = metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0;
+            if metadata.uid() != 0 || shared {
+                let who = if metadata.uid() != 0 {
+                    format!("belongs to {}", owner::name_of(metadata.uid()))
+                } else {
+                    "is writable by other users".to_owned()
+                };
+                return Err(Error::new(
+                    Reason::PermissionDenied,
+                    format!(
+                        "Can't use store {} as root. {} {who}, who could replace the store while beavy works in it.",
+                        self.root.display(),
+                        dir.display()
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Whether the store exists, after checking that this beavy can read it.
     pub(crate) fn exists(&self) -> Result<bool, Error> {
         let marker = self.join(STORE_FILE);
@@ -318,8 +404,16 @@ impl Store {
 
     fn create(&self) -> Result<(), Error> {
         let shown = self.root.display();
-        fs::create_dir_all(&self.root)
-            .map_err(|err| fs_error(err, format!("create store {shown}")))?;
+        if let Some(parent) = self.root.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| fs_error(err, format!("create store {shown}")))?;
+        }
+        match fs::DirBuilder::new().mode(0o700).create(&self.root) {
+            Err(err) if err.kind() != ErrorKind::AlreadyExists => {
+                return Err(fs_error(err, format!("create store {shown}")));
+            }
+            _ => {}
+        }
         for dir in [LAYERS, SNAPSHOTS, TRASH, TMP] {
             let path = self.join(dir);
             match fs::create_dir(&path) {
@@ -341,6 +435,7 @@ impl Store {
             .create(true)
             .truncate(false)
             .mode(0o644)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&path)
             .map_err(|err| fs_error(err, format!("open {}", path.display())))?;
         lock_file(&file, libc::LOCK_EX)
@@ -373,7 +468,7 @@ impl Store {
         let mut warnings = Vec::new();
         for entry in list_dir(&self.join(TMP))? {
             let path = self.join(TMP).join(&entry);
-            let Ok(file) = File::open(&path) else {
+            let Ok(file) = at::open_dir(&path).map(File::from) else {
                 continue;
             };
             if try_lock_file(&file, libc::LOCK_EX).unwrap_or(false)
@@ -438,9 +533,19 @@ pub(crate) fn list_dir(path: &Path) -> Result<Vec<OsString>, Error> {
     Ok(names)
 }
 
-/// Read a JSON record, or `None` when the file doesn't exist.
+/// Read a JSON record, or `None` when the file doesn't exist. A symlink is never
+/// followed.
 pub(crate) fn read_record<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, Error> {
-    let bytes = match fs::read(path) {
+    let read = || -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?
+            .read_to_end(&mut bytes)?;
+        Ok(bytes)
+    };
+    let bytes = match read() {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(fs_error(err, format!("read {}", path.display()))),

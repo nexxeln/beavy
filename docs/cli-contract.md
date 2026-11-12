@@ -116,7 +116,7 @@ On failure with `--json`, stderr gets one line:
 | `missing_argument` | Missing input | 2 | `action_required` | Required input is missing and the run can't prompt for it |
 | `confirmation_required` | Missing input | 2 | `action_required` | A command that destroys data needs `--yes` in a non-interactive run |
 | `not_found` | Not found | 1 | `error` | A named file, directory, snapshot, or trash entry doesn't exist |
-| `permission_denied` | Permission | 1 | `error` | The process isn't allowed to read or change what was named |
+| `permission_denied` | Permission | 1 | `error` | The process isn't allowed to read or change what was named, or beavy won't use the store: it belongs to another user, other users can write to it, or, as root, another user could replace it |
 | `name_taken` | Conflict | 1 | `error` | Another snapshot in the store has the name |
 | `snapshot_in_use` | Conflict | 1 | `error` | A snapshot can't be deleted while another snapshot was made from it |
 | `unsupported_git_state` | Conflict | 1 | `error` | The project is a linked Git worktree or submodule, or its repository is in the middle of a merge, rebase, cherry-pick, revert, or bisect |
@@ -202,6 +202,25 @@ Reads never create a store; the first change does. Every change takes the store'
 lock and first repairs whatever an interrupted command left behind, so a killed
 command never leaves a half-made snapshot in view. A store records its
 layout version, and a beavy that can't read it fails with `invalid_store`.
+
+A store belongs to the user who created it, and every file beavy reads or writes
+in a store, it reads or writes as that user:
+
+- Run as a user, beavy uses only that user's stores. A store owned by someone else
+  fails with `permission_denied`.
+- Run through `sudo`, beavy works for the user who ran sudo (`SUDO_UID` and
+  `SUDO_GID`): it creates and changes stores as that user, so nothing in a store
+  or on the way to it ends up owned by root. When sudo set `HOME` to root's home,
+  the default store is under the invoking user's home instead. A store that user
+  doesn't own fails with `permission_denied`.
+- Run as root with no invoking user, such as from a root login, beavy works in a
+  root-owned store as root and in another user's store as that user. A root-owned
+  store fails with `permission_denied` when a directory on the way to it belongs
+  to another user or is writable by others without the sticky bit, because that
+  user could replace it while beavy works.
+
+beavy refuses a store that users other than its owner can write, with
+`permission_denied` and a next command that removes their write access.
 Snapshots need Linux; on other platforms these commands fail with
 `backend_unavailable`.
 
@@ -291,9 +310,9 @@ beavy snapshots create [--name <NAME>] [--store <DIR>] [--json]
 The command copies the project into the store once. It clones
 files with `FICLONE` when the filesystem supports reflinks and copies them
 otherwise. It keeps modes, times, symlinks, FIFOs, and hard links, and ownership
-only as root. It never reads or writes through a symlink, and each file keeps the
-owner and mode of the file it actually read. It skips sockets and device nodes
-with an `entries_skipped` warning.
+only when it works as root. It never reads or writes through a symlink, and each
+file keeps the owner and mode of the file it actually read. It skips sockets and
+device nodes with an `entries_skipped` warning.
 The project itself is only read, and never becomes part of a mount. In the copy,
 Git's HEAD is detached at the current commit, with the index and working tree as
 they were. A linked Git worktree or submodule fails with `unsupported_git_state`

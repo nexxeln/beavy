@@ -93,6 +93,7 @@ pub struct Deleted {
 impl Store {
     /// Every snapshot, newest first.
     pub fn snapshots(&self) -> Result<Vec<Snapshot>, Error> {
+        let _acting = self.act()?;
         let records = self.read_snapshots()?;
         Ok(records
             .iter()
@@ -102,6 +103,7 @@ impl Store {
 
     /// The snapshot whose ID or name is `selector`.
     pub fn snapshot(&self, selector: &str) -> Result<Snapshot, Error> {
+        let _acting = self.act()?;
         let records = self.read_snapshots()?;
         let record = find(&records, selector).ok_or_else(|| self.snapshot_not_found(selector))?;
         Ok(view(record, &records))
@@ -114,6 +116,7 @@ impl Store {
         if let Some(name) = name {
             validate_name(name)?;
         }
+        let _acting = self.act()?;
         let shown = directory.display();
         let directory = fs::canonicalize(directory).map_err(|err| match err.kind() {
             ErrorKind::NotFound => Error::new(
@@ -236,6 +239,7 @@ impl Store {
     /// Move a snapshot to the trash. Its layers stay until the trash is emptied.
     /// Refused while another snapshot was made from it.
     pub fn delete_snapshot(&self, selector: &str) -> Result<Deleted, Error> {
+        let _acting = self.act()?;
         if !self.exists()? {
             return Err(self.snapshot_not_found(selector));
         }
