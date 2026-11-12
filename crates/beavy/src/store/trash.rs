@@ -195,7 +195,7 @@ impl Store {
     pub(crate) fn trashed_snapshots(&self) -> Result<Vec<SnapshotRecord>, Error> {
         let mut records = Vec::new();
         for entry in list_dir(&self.join(TRASH))? {
-            let path = self.join(TRASH).join(entry).join(SNAPSHOT_FILE);
+            let path = self.join(TRASH).join(&entry).join(SNAPSHOT_FILE);
             if let Some(record) = read_record::<SnapshotRecord>(&path)? {
                 records.push(record);
             }

@@ -134,7 +134,7 @@ to `error::Reason` in the same change.
 | Reason | When |
 | --- | --- |
 | `cleanup_failed` | A temporary file or directory beavy created couldn't be removed. The message names the path |
-| `entries_skipped` | An import left out entries it can't copy: sockets, and device nodes when beavy isn't root. The message names them |
+| `entries_skipped` | An import left out entries it can't copy: sockets and device nodes. The message names them |
 
 ## Human output
 
@@ -291,7 +291,9 @@ beavy snapshots create [--name <NAME>] [--store <DIR>] [--json]
 The command copies the project into the store once. It clones
 files with `FICLONE` when the filesystem supports reflinks and copies them
 otherwise. It keeps modes, times, symlinks, FIFOs, and hard links, and ownership
-only as root. It skips sockets and device nodes with an `entries_skipped` warning.
+only as root. It never reads or writes through a symlink, and each file keeps the
+owner and mode of the file it actually read. It skips sockets and device nodes
+with an `entries_skipped` warning.
 The project itself is only read, and never becomes part of a mount. In the copy,
 Git's HEAD is detached at the current commit, with the index and working tree as
 they were. A linked Git worktree or submodule fails with `unsupported_git_state`

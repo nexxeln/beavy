@@ -322,6 +322,26 @@ fn interrupted_imports_and_deletes_are_repaired() {
 }
 
 #[test]
+fn a_symlinked_head_is_never_written_through() {
+    let f = Fixture::new();
+    f.git(&["init", "-q", "-b", "main"]);
+    f.git(&["add", "."]);
+    f.git(&["commit", "-q", "-m", "first"]);
+    let other = f.home.join("other.git");
+    fs::create_dir(&other).unwrap();
+    fs::write(other.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+    let head = f.project.join(".git/HEAD");
+    fs::remove_file(&head).unwrap();
+    std::os::unix::fs::symlink(other.join("HEAD"), &head).unwrap();
+
+    f.ok(&["snapshots", "create"]);
+    assert_eq!(
+        fs::read_to_string(other.join("HEAD")).unwrap(),
+        "ref: refs/heads/main\n"
+    );
+}
+
+#[test]
 fn a_store_inside_the_project_is_left_out_of_the_import() {
     let f = Fixture::new();
     let inner = f.project.join(".beavy-store");

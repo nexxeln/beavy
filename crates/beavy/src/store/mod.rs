@@ -22,7 +22,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use crate::envelope::{Warning, WarningReason};
 use crate::error::{Error, Next, Reason};
 
+mod at;
 mod git;
 mod snapshot;
 mod trash;
@@ -195,7 +196,7 @@ pub(crate) struct Guard {
 /// unless it was moved into place with [`Scratch::persist`].
 pub(crate) struct Scratch {
     path: PathBuf,
-    _lock: File,
+    dir: File,
     persisted: bool,
 }
 
@@ -204,10 +205,25 @@ impl Scratch {
         &self.path
     }
 
-    /// Rename the directory to `target`, which must be on the same filesystem.
+    /// The directory, open and locked. Work inside it goes through this
+    /// descriptor, so renaming tmp/<entry> can't redirect it.
+    pub(crate) fn dir(&self) -> &File {
+        &self.dir
+    }
+
+    /// Rename the directory to `target`, which must be on the same filesystem, and
+    /// check that what arrived there is this directory.
     pub(crate) fn persist(mut self, target: &Path) -> io::Result<()> {
         fs::rename(&self.path, target)?;
         self.persisted = true;
+        let moved = fs::symlink_metadata(target)?;
+        let dir = self.dir.metadata()?;
+        if (moved.dev(), moved.ino()) != (dir.dev(), dir.ino()) {
+            return Err(io::Error::other(format!(
+                "{} was replaced while beavy worked in it",
+                self.path.display()
+            )));
+        }
         Ok(())
     }
 
@@ -336,13 +352,17 @@ impl Store {
     /// sees it before it's locked.
     pub(crate) fn scratch(&self, _guard: &Guard) -> Result<Scratch, Error> {
         let path = self.join(TMP).join(random_id());
-        fs::create_dir(&path).map_err(|err| fs_error(err, format!("create {}", path.display())))?;
-        let lock = File::open(&path)
-            .and_then(|file| lock_file(&file, libc::LOCK_EX).map(|()| file))
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .map_err(|err| fs_error(err, format!("create {}", path.display())))?;
+        let dir = at::open_dir(&path)
+            .map(File::from)
+            .and_then(|dir| lock_file(&dir, libc::LOCK_EX).map(|()| dir))
             .map_err(|err| fs_error(err, format!("lock {}", path.display())))?;
         Ok(Scratch {
             path,
-            _lock: lock,
+            dir,
             persisted: false,
         })
     }

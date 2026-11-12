@@ -156,11 +156,16 @@ impl Store {
         let scratch = self.scratch(&guard)?;
         drop(guard);
 
-        let copied = tree::copy(&directory, scratch.path(), identity(self.path()))?;
+        let copied = tree::copy(
+            &directory,
+            scratch.dir(),
+            scratch.path(),
+            identity(self.path()),
+        )?;
         crash_point("snapshot-import");
-        let commit = git::head(|relative| fs::read_to_string(scratch.path().join(relative)).ok());
+        let commit = git::head(git::reader(scratch.dir()));
         if let Some(commit) = &commit {
-            git::detach(scratch.path(), commit).map_err(|err| {
+            git::detach(scratch.dir(), commit).map_err(|err| {
                 fs_error(err, format!("detach HEAD in {}", scratch.path().display()))
             })?;
         }
