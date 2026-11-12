@@ -35,7 +35,7 @@ use super::trash::Kind;
 use super::{
     FORMAT, Guard, LAYERS, SNAPSHOTS, Store, WORKTREES, at, crash_point, damaged, fs_error, is_id,
     is_random_id, is_temporary_record, list_dir, lock_file, owner, random_id, read_record,
-    try_lock_file, validate_name, write_record,
+    sync_data, try_lock_file, validate_name, write_record,
 };
 use crate::envelope::Warning;
 use crate::error::{Error, Next, Reason};
@@ -698,6 +698,10 @@ impl Store {
                 created_at: time::now(),
             },
         };
+        let store = at::open_dir(self.path())
+            .map(File::from)
+            .map_err(|err| fs_error(err, format!("open store {}", self.path().display())))?;
+        sync_data(&store, self.path())?;
         write_record(&dir, SEAL, &journal)?;
         crash_point("seal-journal");
         let target = self.join(LAYERS).join(&layer);
