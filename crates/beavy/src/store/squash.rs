@@ -150,7 +150,12 @@ fn place(
     let kind = metadata.file_type();
     if kind.is_file() {
         return match fs::hard_link(source, target) {
-            Err(err) if err.raw_os_error() == Some(libc::EMLINK) => {
+            Err(err)
+                if matches!(
+                    err.raw_os_error(),
+                    Some(libc::EMLINK | libc::EPERM | libc::EXDEV)
+                ) =>
+            {
                 fs::copy(source, target)?;
                 attributes(target, metadata, privileged, true)
             }
@@ -258,6 +263,40 @@ mod tests {
     fn whiteout(path: &Path) {
         let path = CString::new(path.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mknod(path.as_ptr(), libc::S_IFCHR, 0) }, 0);
+    }
+
+    #[test]
+    fn merge_copies_a_file_it_may_not_link() {
+        let protected = fs::read_to_string("/proc/sys/fs/protected_hardlinks")
+            .is_ok_and(|value| value.trim() == "1");
+        // Only root can make a file that belongs to someone else.
+        if !crate::store::owner::privileged() || !protected {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (base, one, out) = (
+            dir.path().join("base"),
+            dir.path().join("1"),
+            dir.path().join("out"),
+        );
+        for path in [&base, &one, &out] {
+            fs::create_dir(path).unwrap();
+        }
+        fs::write(one.join("root-file"), b"root").unwrap();
+        for path in [dir.path(), &base, &one, &out] {
+            std::os::unix::fs::chown(path, Some(65534), Some(65534)).unwrap();
+        }
+        let user = crate::store::owner::Identity {
+            uid: 65534,
+            gid: 65534,
+            groups: vec![65534],
+        };
+        let acting = crate::store::owner::act_as(&user).unwrap();
+        let merged = merge(&base, std::slice::from_ref(&one), &out);
+        drop(acting);
+        merged.unwrap();
+        assert_eq!(fs::read(out.join("root-file")).unwrap(), b"root");
+        assert_eq!(fs::metadata(out.join("root-file")).unwrap().nlink(), 1);
     }
 
     #[test]
