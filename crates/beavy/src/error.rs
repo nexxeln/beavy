@@ -73,6 +73,7 @@ pub enum Reason {
     UnsupportedGitState,
     IoError,
     InvalidStore,
+    BackendUnavailable,
     InternalError,
     Canceled,
 }
@@ -89,7 +90,9 @@ impl Reason {
             Reason::NameTaken | Reason::SnapshotInUse | Reason::UnsupportedGitState => {
                 ErrorClass::Conflict
             }
-            Reason::IoError | Reason::InvalidStore => ErrorClass::System,
+            Reason::IoError | Reason::InvalidStore | Reason::BackendUnavailable => {
+                ErrorClass::System
+            }
             Reason::InternalError => ErrorClass::Internal,
             Reason::Canceled => ErrorClass::Canceled,
         }
@@ -109,6 +112,7 @@ impl Reason {
             Reason::UnsupportedGitState => "unsupported_git_state",
             Reason::IoError => "io_error",
             Reason::InvalidStore => "invalid_store",
+            Reason::BackendUnavailable => "backend_unavailable",
             Reason::InternalError => "internal_error",
             Reason::Canceled => "canceled",
         }
@@ -282,6 +286,7 @@ mod tests {
             (Reason::UnsupportedGitState, 1, Status::Error),
             (Reason::IoError, 1, Status::Error),
             (Reason::InvalidStore, 1, Status::Error),
+            (Reason::BackendUnavailable, 1, Status::Error),
             (Reason::InternalError, 1, Status::Error),
             (Reason::Canceled, 130, Status::Error),
         ];
@@ -306,6 +311,7 @@ mod tests {
             Reason::UnsupportedGitState,
             Reason::IoError,
             Reason::InvalidStore,
+            Reason::BackendUnavailable,
             Reason::InternalError,
             Reason::Canceled,
         ] {

@@ -12,10 +12,25 @@ use clap::error::{ContextKind, ContextValue, ErrorKind as ClapErrorKind};
 use clap::{ArgAction, Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde::Serialize;
 
+#[cfg(target_os = "linux")]
+mod format;
 mod host;
+#[cfg(target_os = "linux")]
+mod snapshots;
+#[cfg(target_os = "linux")]
+mod store;
+#[cfg(target_os = "linux")]
+mod trash;
 
 const HELP_TEMPLATE: &str = "{usage-heading} {usage}\n{about}\n\n{all-args}{after-help}";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Root help groups commands by task. Every subcommand that isn't hidden must
+/// appear in exactly one group.
+const COMMAND_GROUPS: &[(&str, &[&str])] = &[
+    ("Snapshots", &["snapshots", "trash"]),
+    ("Machine", &["host"]),
+];
 
 /// Monorepo tooling for teams that work in parallel
 #[derive(Parser)]
@@ -24,8 +39,6 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
     disable_version_flag = true,
     disable_help_flag = true,
     disable_help_subcommand = true,
-    help_template = HELP_TEMPLATE,
-    subcommand_help_heading = "Machine",
     subcommand_value_name = "COMMAND"
 )]
 struct Cli {
@@ -58,8 +71,32 @@ struct Global {
     version: bool,
 }
 
+/// Where snapshots live.
+#[derive(Args)]
+struct StoreArgs {
+    /// Store directory (default: one per project, under ~/.local/share/beavy/stores)
+    #[arg(long, global = true, value_name = "DIR")]
+    store: Option<PathBuf>,
+}
+
 #[derive(Subcommand)]
 enum Command {
+    /// Create, inspect, and delete snapshots of a project
+    #[command(help_template = HELP_TEMPLATE, subcommand_value_name = "COMMAND")]
+    Snapshots {
+        #[command(flatten)]
+        store: StoreArgs,
+        #[command(subcommand)]
+        command: Option<SnapshotsCommand>,
+    },
+    /// Restore deleted snapshots, or empty the trash
+    #[command(help_template = HELP_TEMPLATE, subcommand_value_name = "COMMAND")]
+    Trash {
+        #[command(flatten)]
+        store: StoreArgs,
+        #[command(subcommand)]
+        command: Option<TrashCommand>,
+    },
     /// Inspect this machine
     #[command(help_template = HELP_TEMPLATE, subcommand_value_name = "COMMAND")]
     Host {
@@ -73,6 +110,123 @@ enum Command {
         path: Vec<String>,
     },
 }
+
+#[derive(Subcommand)]
+enum SnapshotsCommand {
+    /// Create a snapshot of the project directory
+    #[command(help_template = HELP_TEMPLATE, after_help = SNAPSHOTS_CREATE_HELP)]
+    Create {
+        /// Name for the snapshot, unique in the store
+        #[arg(long, value_name = "NAME")]
+        name: Option<String>,
+    },
+    /// List snapshots
+    #[command(help_template = HELP_TEMPLATE, after_help = SNAPSHOTS_LIST_HELP)]
+    List,
+    /// Show a snapshot
+    #[command(help_template = HELP_TEMPLATE, after_help = SNAPSHOTS_INSPECT_HELP)]
+    Inspect {
+        /// Snapshot ID or name
+        #[arg(value_name = "SNAPSHOT")]
+        snapshot: String,
+    },
+    /// Move a snapshot to the trash
+    #[command(help_template = HELP_TEMPLATE, after_help = SNAPSHOTS_DELETE_HELP)]
+    Delete {
+        /// Snapshot ID or name
+        #[arg(value_name = "SNAPSHOT")]
+        snapshot: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum TrashCommand {
+    /// List deleted snapshots
+    #[command(help_template = HELP_TEMPLATE, after_help = TRASH_LIST_HELP)]
+    List,
+    /// Restore a deleted snapshot
+    #[command(help_template = HELP_TEMPLATE, after_help = TRASH_RESTORE_HELP)]
+    Restore {
+        /// ID of the deleted snapshot
+        #[arg(value_name = "ID")]
+        id: String,
+    },
+    /// Delete everything in the trash for good
+    #[command(help_template = HELP_TEMPLATE, after_help = TRASH_EMPTY_HELP)]
+    Empty {
+        /// Confirm deleting the trash's contents
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+}
+
+const SNAPSHOTS_CREATE_HELP: &str = "\
+Examples:
+  Snapshot the current project
+    beavy snapshots create
+
+  Snapshot a project by name and read the result as JSON
+    beavy snapshots create --cwd <DIR> --name <NAME> --json
+
+Notes:
+  The project is the nearest directory above --cwd that has a store, else the
+  root of its Git working tree, else --cwd itself. The command copies it into
+  the store once, cloning files when the filesystem supports reflinks, and
+  never changes it. In the copy, Git's HEAD is detached at the current commit.
+  It refuses linked worktrees and repositories in the middle of a merge,
+  rebase, cherry-pick, revert, or bisect.
+
+Learn more: https://github.com/nexxeln/beavy/blob/main/docs/cli-contract.md#beavy-snapshots-create";
+
+const SNAPSHOTS_LIST_HELP: &str = "\
+Examples:
+  List snapshots, newest first
+    beavy snapshots list
+
+Learn more: https://github.com/nexxeln/beavy/blob/main/docs/cli-contract.md#beavy-snapshots-list";
+
+const SNAPSHOTS_INSPECT_HELP: &str = "\
+Examples:
+  Show a snapshot as JSON
+    beavy snapshots inspect <SNAPSHOT> --json
+
+Learn more: https://github.com/nexxeln/beavy/blob/main/docs/cli-contract.md#beavy-snapshots-inspect";
+
+const SNAPSHOTS_DELETE_HELP: &str = "\
+Examples:
+  Delete a snapshot
+    beavy snapshots delete <SNAPSHOT>
+
+Notes:
+  The snapshot moves to the trash and its data stays on disk until
+  beavy trash empty. Refused while another snapshot was made from it.
+
+Learn more: https://github.com/nexxeln/beavy/blob/main/docs/cli-contract.md#beavy-snapshots-delete";
+
+const TRASH_LIST_HELP: &str = "\
+Examples:
+  List deleted snapshots, most recently deleted first
+    beavy trash list
+
+Learn more: https://github.com/nexxeln/beavy/blob/main/docs/cli-contract.md#beavy-trash-list";
+
+const TRASH_RESTORE_HELP: &str = "\
+Examples:
+  Restore a deleted snapshot
+    beavy trash restore <ID>
+
+Learn more: https://github.com/nexxeln/beavy/blob/main/docs/cli-contract.md#beavy-trash-restore";
+
+const TRASH_EMPTY_HELP: &str = "\
+Examples:
+  Empty the trash in a script or agent, after a human approves
+    beavy trash empty --yes
+
+Notes:
+  Deletes every snapshot in the trash, with the data only they use. This can't
+  be undone, so a run without a terminal needs --yes.
+
+Learn more: https://github.com/nexxeln/beavy/blob/main/docs/cli-contract.md#beavy-trash-empty";
 
 #[derive(Subcommand)]
 enum HostCommand {
@@ -103,8 +257,36 @@ fn main() -> ExitCode {
     ExitCode::from(run(std::env::args_os().collect()))
 }
 
-fn run(args: Vec<OsString>) -> u8 {
+/// The command tree, with root help grouped by task.
+fn cli_command() -> clap::Command {
     let mut command = Cli::command();
+    command.build();
+    let width = command
+        .get_subcommands()
+        .filter(|sub| !sub.is_hide_set())
+        .map(|sub| sub.get_name().len())
+        .max()
+        .unwrap_or(0);
+    let mut groups = String::new();
+    for (heading, names) in COMMAND_GROUPS {
+        groups.push_str(&format!("{heading}:\n"));
+        for name in *names {
+            let about = command
+                .find_subcommand(name)
+                .and_then(|sub| sub.get_about())
+                .map(|about| about.to_string())
+                .unwrap_or_default();
+            groups.push_str(&format!("  {name:<width$}  {about}\n"));
+        }
+        groups.push('\n');
+    }
+    command.help_template(format!(
+        "{{usage-heading}} {{usage}}\n{{about}}\n\n{groups}Global Options:\n{{options}}{{after-help}}"
+    ))
+}
+
+fn run(args: Vec<OsString>) -> u8 {
+    let mut command = cli_command();
     let parsed = command
         .try_get_matches_from_mut(&args)
         .and_then(|matches| Cli::from_arg_matches(&matches));
@@ -136,17 +318,45 @@ fn dispatch(
         Some(Command::Host { command: None }) => help(root, &["host".into()], output),
         Some(Command::Host {
             command: Some(HostCommand::Check),
-        }) => {
-            let directory = match &cli.global.cwd {
-                Some(dir) => dir.clone(),
-                None => std::env::current_dir().map_err(|err| {
-                    Error::new(Reason::IoError, "Failed to read the current directory.")
-                        .with_cause(err)
-                })?,
-            };
-            host::check(output, &directory)
-        }
+        }) => host::check(output, &working_directory(&cli.global)?),
+        Some(Command::Snapshots { command: None, .. }) => help(root, &["snapshots".into()], output),
+        Some(Command::Trash { command: None, .. }) => help(root, &["trash".into()], output),
+        #[cfg(target_os = "linux")]
+        Some(Command::Snapshots {
+            store,
+            command: Some(command),
+        }) => snapshots::run(output, &cli.global, store, command),
+        #[cfg(target_os = "linux")]
+        Some(Command::Trash {
+            store,
+            command: Some(command),
+        }) => trash::run(output, &cli.global, store, command),
+        #[cfg(not(target_os = "linux"))]
+        Some(Command::Snapshots { .. } | Command::Trash { .. }) => Err(unavailable().into()),
     }
+}
+
+/// The directory an invocation works in: `--cwd`, or the current directory.
+fn working_directory(global: &Global) -> Result<PathBuf, Error> {
+    match &global.cwd {
+        Some(dir) => Ok(dir.clone()),
+        None => std::env::current_dir().map_err(|err| {
+            Error::new(Reason::IoError, "Failed to read the current directory.").with_cause(err)
+        }),
+    }
+}
+
+/// The store only runs on Linux so far, so every other platform refuses snapshots.
+#[cfg(not(target_os = "linux"))]
+fn unavailable() -> Error {
+    Error::new(
+        Reason::BackendUnavailable,
+        "Can't use snapshots on this system yet. beavy's store only runs on Linux so far.",
+    )
+    .with_next(
+        "See which backends this machine supports",
+        Next::new(["beavy", "host", "check"]),
+    )
 }
 
 fn finish(output: &mut Output<io::Stdout, io::Stderr>, result: Result<(), Failure>) -> u8 {
