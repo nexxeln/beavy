@@ -11,10 +11,9 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::{CString, OsString};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use rustix::process::Gid;
@@ -192,8 +191,9 @@ pub(crate) fn mounts_of(table: &[Mount], source: &Path) -> Vec<PathBuf> {
 /// Processes outside this mount namespace with an overlay mount whose source is
 /// `source`, a worktree directory: commands running in the worktree, and anything
 /// they started that is still there, whether or not it kept the run's lock. With
-/// `at`, only mounts on that directory count. A process beavy can't read is
-/// missed, so run this as root to see every namespace.
+/// `at`, only mounts on that directory count. Each namespace's table is read
+/// once. Anyone may read a process's mount table, so only a process that /proc
+/// hides from beavy, with `hidepid`, is missed.
 pub(crate) fn holders(source: &Path, at: Option<&Path>) -> Vec<u32> {
     let wanted = |mount: &Mount| mount.fstype == "overlay" && Path::new(&mount.source) == source;
     let own: HashSet<u64> = mounts(None)
@@ -216,28 +216,42 @@ pub(crate) fn holders(source: &Path, at: Option<&Path>) -> Vec<u32> {
         if pid == me {
             continue;
         }
-        let namespace = fs::metadata(format!("/proc/{pid}/ns/mnt"))
-            .ok()
-            .map(|metadata| metadata.ino());
-        let known = namespace.and_then(|namespace| namespaces.get(&namespace).copied());
-        let holds = known.unwrap_or_else(|| {
-            let holds = mounts(Some(pid)).is_ok_and(|table| {
-                table.iter().any(|mount| {
+        let Some(namespace) = first_mount(pid) else {
+            continue;
+        };
+        let holds = match namespaces.get(&namespace) {
+            Some(holds) => *holds,
+            None => {
+                let Ok(table) = mounts(Some(pid)) else {
+                    continue;
+                };
+                let holds = table.iter().any(|mount| {
                     wanted(mount)
                         && !own.contains(&mount.id)
                         && at.is_none_or(|at| mount.point == at)
-                })
-            });
-            if let Some(namespace) = namespace {
+                });
                 namespaces.insert(namespace, holds);
+                holds
             }
-            holds
-        });
+        };
         if holds {
             pids.push(pid);
         }
     }
     pids
+}
+
+/// The ID of the first mount in a process's mount table. A mount belongs to one
+/// namespace, so the ID names the process's mount namespace, and reading one
+/// line costs a fraction of reading the whole table.
+fn first_mount(pid: u32) -> Option<u64> {
+    let mut line = [0; 32];
+    let read = fs::File::open(format!("/proc/{pid}/mountinfo"))
+        .ok()?
+        .read(&mut line)
+        .ok()?;
+    let id = line[..read].split(|b| *b == b' ').next()?;
+    std::str::from_utf8(id).ok()?.parse().ok()
 }
 
 /// A directory beavy opened and checked before fork. A descriptor belongs to the
@@ -677,5 +691,11 @@ mod tests {
         assert_eq!(unescape(br"plain\0"), br"plain\0");
         let table = mounts(None).unwrap();
         assert!(table.iter().any(|mount| mount.point == Path::new("/")));
+    }
+
+    #[test]
+    fn a_namespace_is_named_by_the_first_mount_in_its_table() {
+        let table = mounts(None).unwrap();
+        assert_eq!(first_mount(std::process::id()), Some(table[0].id));
     }
 }
