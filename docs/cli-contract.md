@@ -121,7 +121,7 @@ On failure with `--json`, stderr gets one line:
 | `snapshot_in_use` | Conflict | 1 | `error` | A snapshot can't be deleted while another snapshot was made from it |
 | `unsupported_git_state` | Conflict | 1 | `error` | The project is a linked Git worktree or submodule, or its repository is in the middle of a merge, rebase, cherry-pick, revert, or bisect |
 | `io_error` | System | 1 | `error` | The operating system failed a read or write |
-| `invalid_store` | System | 1 | `error` | The store has a layout version this beavy can't read, or a damaged record |
+| `invalid_store` | System | 1 | `error` | The store has a layout version this beavy can't read, or a damaged record, such as one whose ID isn't an ID |
 | `backend_unavailable` | System | 1 | `error` | This platform can't keep snapshots yet: beavy's store only runs on Linux |
 | `internal_error` | Internal | 1 | `error` | A bug in beavy |
 | `canceled` | Canceled | 130 | `error` | The user declined a confirmation; nothing changed |
@@ -204,7 +204,9 @@ exist or is empty. A directory with anything else in it fails with
 Every change takes the store's lock and first repairs whatever an interrupted
 command left behind, so a killed command never leaves a half-made snapshot in
 view. Repair only touches names beavy makes. A store records its layout version,
-and a beavy that can't read it fails with `invalid_store`.
+and a beavy that can't read it fails with `invalid_store`. beavy checks every
+record before using an ID or layer name from it as part of a path, and a record
+that fails the check fails the command with `invalid_store`.
 
 A store belongs to the user who created it, and every file beavy reads or writes
 in a store, it reads or writes as that user:

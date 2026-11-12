@@ -7,9 +7,9 @@ use std::io::ErrorKind;
 
 use serde::{Deserialize, Serialize};
 
-use super::snapshot::SnapshotRecord;
+use super::snapshot::{self, SnapshotRecord};
 use super::{
-    FORMAT, SNAPSHOTS, Store, TRASH, fs_error, is_id, list_dir, read_record, write_record,
+    FORMAT, SNAPSHOTS, Store, TRASH, damaged, fs_error, is_id, list_dir, read_record, write_record,
 };
 use crate::envelope::Warning;
 use crate::error::{Error, Reason};
@@ -220,6 +220,7 @@ impl Store {
             }
             let path = self.join(TRASH).join(&entry).join(SNAPSHOT_FILE);
             if let Some(record) = read_record::<SnapshotRecord>(&path)? {
+                snapshot::check(&record, &path, entry.to_str().unwrap_or_default())?;
                 records.push(record);
             }
         }
@@ -235,10 +236,17 @@ impl Store {
                 continue;
             }
             let dir = self.join(TRASH).join(&entry);
-            let Some(record) = read_record::<EntryRecord>(&dir.join(ENTRY_FILE))? else {
+            let path = dir.join(ENTRY_FILE);
+            let Some(record) = read_record::<EntryRecord>(&path)? else {
                 continue;
             };
-            if dir.join(record.kind.payload()).exists() {
+            if !is_id(record.kind.prefix(), &record.id) || entry.to_str() != Some(&record.id) {
+                return Err(damaged(
+                    &path,
+                    format!("its ID {:?} isn't the entry's name", record.id),
+                ));
+            }
+            if fs::symlink_metadata(dir.join(record.kind.payload())).is_ok() {
                 records.push(record);
             }
         }
@@ -261,7 +269,9 @@ impl Store {
             let complete = read_record::<EntryRecord>(&dir.join(ENTRY_FILE))
                 .ok()
                 .flatten()
-                .is_some_and(|record| dir.join(record.kind.payload()).exists());
+                .is_some_and(|record| {
+                    fs::symlink_metadata(dir.join(record.kind.payload())).is_ok()
+                });
             if !complete && let Err(err) = super::tree::remove(&dir) {
                 warnings.push(super::cleanup_warning(&dir, &err));
             }

@@ -17,7 +17,8 @@
 //! changes the store removes those leftovers before it does anything else.
 //!
 //! Every file system call in a store runs as the store's owner (see [`owner`]),
-//! and beavy refuses a store that anyone else can write.
+//! and beavy refuses a store that anyone else can write. Records are untrusted
+//! input: an ID or layer name is checked before it becomes part of a path.
 
 use std::collections::HashSet;
 use std::ffi::OsString;
@@ -636,6 +637,18 @@ fn is_temporary_record(name: &std::ffi::OsStr) -> bool {
         && name.starts_with(b".")
         && name[name.len() - 11] == b'.'
         && is_random_id(std::ffi::OsStr::from_bytes(&name[name.len() - 10..]))
+}
+
+/// A record whose contents can't be right, such as an ID that isn't one.
+pub(crate) fn damaged(path: &Path, problem: impl AsRef<str>) -> Error {
+    Error::new(
+        Reason::InvalidStore,
+        format!(
+            "Can't use {}. It isn't a valid beavy record: {}.",
+            path.display(),
+            problem.as_ref()
+        ),
+    )
 }
 
 /// Ten random characters from a lowercase alphabet without look-alikes.

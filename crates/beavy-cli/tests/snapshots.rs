@@ -389,6 +389,33 @@ fn a_store_is_made_only_in_an_empty_directory() {
 }
 
 #[test]
+fn record_ids_never_become_paths_outside_the_store() {
+    let f = Fixture::new();
+    let victim = f.home.join("victim");
+    fs::create_dir(&victim).unwrap();
+    fs::write(victim.join("data"), "keep").unwrap();
+
+    let id = f.ok(&["snapshots", "create"]).trim().to_string();
+    let record = f.store.join("snapshots").join(format!("{id}.json"));
+    let text = fs::read_to_string(&record).unwrap();
+    let layer = &f.entries("layers")[0];
+    fs::write(&record, text.replace(layer.as_str(), "../../home/victim")).unwrap();
+    let refused = f.output(&["snapshots", "list", "--json"]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert_eq!(error(&refused)["reason"], "invalid_store");
+    fs::write(&record, text).unwrap();
+
+    f.ok(&["snapshots", "delete", &id]);
+    let entry = f.store.join("trash").join(&id).join("entry.json");
+    let text = fs::read_to_string(&entry).unwrap();
+    fs::write(&entry, text.replace(&id, "../../home/victim")).unwrap();
+    let refused = f.output(&["trash", "empty", "--yes", "--json"]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert_eq!(error(&refused)["reason"], "invalid_store");
+    assert_eq!(fs::read_to_string(victim.join("data")).unwrap(), "keep");
+}
+
+#[test]
 fn a_symlinked_head_is_never_written_through() {
     let f = Fixture::new();
     f.git(&["init", "-q", "-b", "main"]);

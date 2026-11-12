@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use super::trash::Kind;
 use super::{
-    FORMAT, LAYERS, SNAPSHOTS, Store, crash_point, fs_error, git, identity, list_dir, random_id,
-    read_record, tree, validate_name, write_record,
+    FORMAT, LAYERS, SNAPSHOTS, Store, crash_point, damaged, fs_error, git, identity, is_id,
+    is_random_id, list_dir, random_id, read_record, tree, validate_name, write_record,
 };
 use crate::envelope::{Warning, WarningReason};
 use crate::error::{Error, Reason};
@@ -294,7 +294,10 @@ impl Store {
             if !is_record {
                 continue;
             }
-            if let Some(record) = read_record::<SnapshotRecord>(&dir.join(&name))? {
+            let path = dir.join(&name);
+            if let Some(record) = read_record::<SnapshotRecord>(&path)? {
+                let id = name.to_str().and_then(|name| name.strip_suffix(".json"));
+                check(&record, &path, id.unwrap_or_default())?;
                 records.push(record);
             }
         }
@@ -333,6 +336,32 @@ impl Store {
             self.next(&["beavy", "snapshots", "list"]),
         )
     }
+}
+
+/// Check a snapshot record read from `path` before any of it becomes part of a
+/// path: its ID must be `id`, the name it was stored under.
+pub(crate) fn check(record: &SnapshotRecord, path: &Path, id: &str) -> Result<(), Error> {
+    if !is_id("snap", &record.id) || record.id != id {
+        return Err(damaged(path, format!("its ID {:?} isn't {id}", record.id)));
+    }
+    if record.layers.is_empty() || !record.layers.iter().all(is_random_id) {
+        return Err(damaged(path, "it names a layer that isn't one"));
+    }
+    if record
+        .parent
+        .as_deref()
+        .is_some_and(|parent| !is_id("snap", parent))
+    {
+        return Err(damaged(path, "its parent isn't a snapshot ID"));
+    }
+    if record
+        .name
+        .as_deref()
+        .is_some_and(|name| validate_name(name).is_err())
+    {
+        return Err(damaged(path, "its name isn't a valid name"));
+    }
+    Ok(())
 }
 
 pub(crate) fn find<'a>(
