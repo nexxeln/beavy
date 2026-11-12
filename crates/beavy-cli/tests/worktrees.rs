@@ -9,7 +9,7 @@
 
 use std::fs;
 use std::io::Write;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, symlink};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -211,6 +211,19 @@ fn succeed(mut command: Command) -> String {
         .unwrap()
         .trim_end()
         .to_string()
+}
+
+/// Run `command`, which passes --json, assert it failed, and return its error
+/// document.
+fn refuse(mut command: Command) -> Value {
+    let output = command.output().unwrap();
+    assert!(
+        !output.status.success(),
+        "{command:?}: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(output.stdout.is_empty());
+    document(&output.stderr)
 }
 
 /// The user a root test acts as through sudo, or None when not root.
@@ -631,4 +644,37 @@ fn through_sudo_worktrees_belong_to_and_run_as_the_user_who_ran_it() {
     succeed(f.as_user(&["trash", "empty", "--yes"], user));
     assert!(f.entries("worktrees").is_empty());
     assert!(f.entries("trash").is_empty());
+}
+
+#[test]
+fn through_sudo_a_worktree_is_never_mounted_through_a_link() {
+    let Some(f) = Fixture::new() else { return };
+    let Some(user) = sudo_user() else { return };
+    f.give_to(user);
+    let wt = succeed(f.sudo(&["worktrees", "create", "base"], user));
+    let victim = f.home.with_file_name("victim");
+    fs::create_dir(&victim).unwrap();
+    let dir = f.store.join("worktrees").join(&wt);
+    let run = |script: &str| {
+        let mut command = f.sudo(&["worktrees", "run", &wt, "--json"], user);
+        command.args(["--", "sh", "-c", script]);
+        command
+    };
+
+    fs::rename(dir.join("upper"), dir.join("kept")).unwrap();
+    symlink(&victim, dir.join("upper")).unwrap();
+    refuse(run("echo written > through-upper"));
+    fs::remove_file(dir.join("upper")).unwrap();
+    fs::rename(dir.join("kept"), dir.join("upper")).unwrap();
+
+    let _ = fs::remove_file(dir.join("lock"));
+    symlink(victim.join("through-lock"), dir.join("lock")).unwrap();
+    refuse(run("true"));
+    fs::remove_file(dir.join("lock")).unwrap();
+    assert!(fs::read_dir(&victim).unwrap().next().is_none());
+
+    std::os::unix::fs::chown(&f.project, Some(0), Some(0)).unwrap();
+    assert_eq!(refuse(run("true"))["reason"], "permission_denied");
+    std::os::unix::fs::chown(&f.project, Some(user.0), Some(user.1)).unwrap();
+    assert_eq!(succeed(run("cat README.md")), "readme");
 }

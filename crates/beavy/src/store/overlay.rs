@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use rustix::process::Gid;
 use serde::Serialize;
 
+use super::at;
 use super::owner::{self, Identity};
 use crate::error::{Error, Next, Reason};
 use crate::sys::{
@@ -77,20 +78,17 @@ impl Backend {
 const MAX_OPTIONS: usize = 4095;
 
 /// Mount options for a stack of layers, bottom first, under an upper and a work
-/// directory. Every path is relative to the store root, which keeps the string
-/// far below the one-page limit; the mounting process must have the store root as
-/// its working directory.
-pub(crate) fn options(layers: &[String], upper: &Path, work: &Path) -> Result<CString, Error> {
-    let lower: Vec<String> = layers
-        .iter()
-        .rev()
-        .map(|layer| format!("layers/{layer}"))
-        .collect();
+/// directory, each an open directory. The options name the descriptors as
+/// /proc/self/fd paths, so the kernel mounts exactly the directories beavy opened
+/// and checked, and no path in the store is resolved again.
+pub(crate) fn options<D: AsRawFd>(layers: &[D], upper: &D, work: &D) -> Result<CString, Error> {
+    let fd = |dir: &D| format!("/proc/self/fd/{}", dir.as_raw_fd());
+    let lower: Vec<String> = layers.iter().rev().map(fd).collect();
     let text = format!(
         "lowerdir={},upperdir={},workdir={},userxattr,index=off",
         lower.join(":"),
-        upper.display(),
-        work.display()
+        fd(upper),
+        fd(work)
     );
     if text.len() > MAX_OPTIONS {
         return Err(Error::new(
@@ -181,42 +179,113 @@ pub(crate) fn mounts_of(table: &[Mount], source: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// A directory beavy opened and checked before fork. A descriptor belongs to the
+/// mount namespace it was opened in, and overlayfs takes layers only from the
+/// mounting process's own namespace, so a child that enters a new namespace opens
+/// the directory again by path, onto the same descriptor number, and refuses
+/// anything but the directory it checked.
+pub(crate) struct Opened {
+    path: CString,
+    /// `/proc/self/fd/N` for the descriptor.
+    pub proc: CString,
+    fd: OwnedFd,
+    id: (u64, u64),
+}
+
+impl Opened {
+    pub(crate) fn new(path: &Path, fd: OwnedFd) -> Result<Self, Error> {
+        let id = at::fstat(&fd)
+            .map_err(|err| {
+                Error::new(
+                    Reason::IoError,
+                    format!("Couldn't read {}.", path.display()),
+                )
+                .with_cause(err)
+            })?
+            .id();
+        let proc = CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+            .map_err(|err| Error::new(Reason::InternalError, err.to_string()))?;
+        Ok(Opened {
+            path: c_path(path)?,
+            proc,
+            fd,
+            id,
+        })
+    }
+
+    /// Open the directory again in this process's mount namespace. Fails with
+    /// ESTALE when its path now leads somewhere else. Async-signal-safe calls only.
+    fn reopen(&self) -> Result<(), (u8, i32)> {
+        // SAFETY: path is NUL-terminated, stat is a valid out pointer, and the
+        // descriptor opened here is closed before returning.
+        unsafe {
+            let fd = libc::open(
+                self.path.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            );
+            if fd < 0 {
+                return Err((STAGE_MOUNT, errno()));
+            }
+            let mut stat: libc::stat = std::mem::zeroed();
+            let result = if libc::fstat(fd, &mut stat) != 0 {
+                Err((STAGE_MOUNT, errno()))
+            } else if (stat.st_dev as u64, stat.st_ino as u64) != self.id {
+                Err((STAGE_MOUNT, libc::ESTALE))
+            } else if libc::dup3(fd, self.fd.as_raw_fd(), libc::O_CLOEXEC) < 0 {
+                Err((STAGE_MOUNT, errno()))
+            } else {
+                Ok(())
+            };
+            libc::close(fd);
+            result
+        }
+    }
+}
+
+impl AsRawFd for Opened {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
 /// What an overlay mount needs, prepared before any fork.
 pub(crate) struct Spec {
-    /// The store root, the working directory for the relative paths in `options`.
-    pub store: CString,
     /// The worktree directory, recorded as the mount's source so the mount table
     /// says which worktree a mount belongs to.
     pub source: CString,
     pub options: CString,
+    /// The directories `options` names, open until the mount is made.
+    pub dirs: Vec<Opened>,
 }
 
 impl Spec {
-    /// Mount on `target`. overlayfs works in its layers with the credentials it
-    /// was mounted with, and needs the file capabilities that acting as the
-    /// store's owner set aside, so they're raised again first; the owner's IDs
-    /// stay, so what overlayfs creates belongs to the owner. Async-signal-safe
-    /// calls only.
+    /// Open every directory again after entering a new mount namespace.
+    fn reopen(&self) -> Result<(), (u8, i32)> {
+        self.dirs.iter().try_for_each(Opened::reopen)
+    }
+
+    /// Mount on `target`, without setuid or device files. overlayfs works in its
+    /// layers with the credentials it was mounted with, and needs the file
+    /// capabilities that acting as the store's owner set aside, so they're raised
+    /// again first; the owner's IDs stay, so what overlayfs creates belongs to the
+    /// owner. Async-signal-safe calls only.
     fn mount(&self, target: &CString) -> Result<(), (u8, i32)> {
         let failed = |err: rustix::io::Errno| (STAGE_MOUNT, err.raw_os_error());
         let mut sets = rustix::thread::capabilities(None).map_err(failed)?;
         sets.effective = sets.permitted;
         rustix::thread::set_capabilities(None, sets).map_err(failed)?;
         // SAFETY: every pointer is a NUL-terminated string prepared before fork.
-        unsafe {
-            if libc::chdir(self.store.as_ptr()) != 0 {
-                return Err((STAGE_CHDIR, errno()));
-            }
-            if libc::mount(
+        let rc = unsafe {
+            libc::mount(
                 self.source.as_ptr(),
                 target.as_ptr(),
                 c"overlay".as_ptr(),
-                0,
+                libc::MS_NOSUID | libc::MS_NODEV,
                 self.options.as_ptr().cast(),
-            ) != 0
-            {
-                return Err((STAGE_MOUNT, errno()));
-            }
+            )
+        };
+        if rc != 0 {
+            return Err((STAGE_MOUNT, errno()));
         }
         Ok(())
     }
@@ -251,24 +320,25 @@ fn private_namespace(privilege: Privilege, maps: &IdMaps) -> Result<(), (u8, i32
     Ok(())
 }
 
-/// Mount and unmount in a throwaway namespace, proving the kernel accepts this
-/// stack before beavy records anything that depends on it.
-pub(crate) fn probe(spec: &Spec, target: &Path, privilege: Privilege) -> Result<(), Failure> {
-    let target = c_path(target).map_err(Failure::Other)?;
+/// Mount on `target` in a throwaway namespace, proving the kernel accepts this
+/// stack before beavy records anything that depends on it. The mount goes away
+/// with the namespace.
+pub(crate) fn probe(spec: &Spec, target: &Opened, privilege: Privilege) -> Result<(), Failure> {
     let maps = IdMaps::identity();
     let result = in_child(|| {
         private_namespace(privilege, &maps)?;
-        spec.mount(&target)?;
-        // SAFETY: target is NUL-terminated.
-        unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
-        Ok(())
+        spec.reopen()?;
+        target.reopen()?;
+        spec.mount(&target.proc)
     });
     child_result(result)
 }
 
-/// Mount for every process in this mount namespace. Needs root.
-pub(crate) fn mount_persistent(spec: &Spec, target: &Path) -> Result<(), Failure> {
-    let target = c_path(target).map_err(Failure::Other)?;
+/// Mount for every process in this mount namespace, on the directory open as
+/// `target`. Needs root.
+pub(crate) fn mount_persistent(spec: &Spec, target: &OwnedFd) -> Result<(), Failure> {
+    let target = CString::new(format!("/proc/self/fd/{}", target.as_raw_fd()))
+        .map_err(|err| Failure::Other(Error::new(Reason::InternalError, err.to_string())))?;
     child_result(in_child(|| spec.mount(&target)))
 }
 
@@ -335,8 +405,9 @@ pub(crate) struct Enter {
     pub entry: Entry,
     pub privilege: Privilege,
     pub maps: IdMaps,
-    /// The directory the worktree covers: the path its snapshot was imported from.
-    pub target: CString,
+    /// The directory the worktree covers, open: the path its snapshot was
+    /// imported from, which the worktree is mounted on.
+    pub point: Opened,
     /// The command's working directory, resolved again after the mount.
     pub cwd: CString,
     /// A descriptor to keep open across exec: the lock that marks the run as live.
@@ -365,15 +436,18 @@ impl Enter {
             }
             Entry::Mount(spec) => {
                 private_namespace(self.privilege, &self.maps)?;
-                spec.mount(&self.target)?;
+                spec.reopen()?;
+                self.point.reopen()?;
+                spec.mount(&self.point.proc)?;
             }
             Entry::Bind(from) => {
                 private_namespace(self.privilege, &self.maps)?;
+                self.point.reopen()?;
                 // SAFETY: both paths are NUL-terminated; the other pointers may be null.
                 let rc = unsafe {
                     libc::mount(
                         from.as_ptr(),
-                        self.target.as_ptr(),
+                        self.point.proc.as_ptr(),
                         std::ptr::null(),
                         libc::MS_BIND,
                         std::ptr::null(),
@@ -507,23 +581,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn options_list_layers_top_first_with_relative_paths() {
-        let layers = vec!["base".to_string(), "mid".into(), "top".into()];
-        let options = options(
-            &layers,
-            Path::new("worktrees/wt_a/upper"),
-            Path::new("worktrees/wt_a/work"),
-        )
-        .unwrap();
+    fn options_name_the_open_layers_top_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let open = || super::super::at::open_dir(dir.path()).unwrap();
+        let layers = vec![open(), open(), open()];
+        let (upper, work) = (open(), open());
+        let fd = |dir: &OwnedFd| format!("/proc/self/fd/{}", dir.as_raw_fd());
+        let options = options(&layers, &upper, &work).unwrap();
         assert_eq!(
             options.to_str().unwrap(),
-            "lowerdir=layers/top:layers/mid:layers/base,upperdir=worktrees/wt_a/upper,workdir=worktrees/wt_a/work,userxattr,index=off"
+            format!(
+                "lowerdir={}:{}:{},upperdir={},workdir={},userxattr,index=off",
+                fd(&layers[2]),
+                fd(&layers[1]),
+                fd(&layers[0]),
+                fd(&upper),
+                fd(&work)
+            )
         );
-        let deep: Vec<String> = (0..400).map(|i| format!("{i:010}")).collect();
+        let deep: Vec<OwnedFd> = (0..300).map(|_| open()).collect();
         assert_eq!(
-            super::options(&deep, Path::new("u"), Path::new("w"))
-                .unwrap_err()
-                .reason(),
+            super::options(&deep, &upper, &work).unwrap_err().reason(),
             Reason::InvalidStore
         );
     }

@@ -18,22 +18,23 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions, Permissions};
-use std::io::{ErrorKind, Write};
-use std::os::fd::AsRawFd;
+use std::io::{ErrorKind, Read, Write};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
+use rustix::fs::FileType;
 use serde::{Deserialize, Serialize};
 
-use super::overlay::{self, Backend, Enter, Entry, Failure, Privilege, Spec, c_path};
+use super::overlay::{self, Backend, Enter, Entry, Failure, Opened, Privilege, Spec, c_path};
 use super::snapshot::{self, Method, Snapshot, SnapshotRecord};
 use super::squash::{self, SQUASH_DEPTH};
 use super::trash::Kind;
 use super::{
-    FORMAT, Guard, LAYERS, SNAPSHOTS, Store, WORKTREES, crash_point, fs_error, list_dir, lock_file,
-    owner, random_id, read_record, try_lock_file, validate_name, write_record,
+    FORMAT, Guard, LAYERS, SNAPSHOTS, Store, WORKTREES, at, crash_point, fs_error, list_dir,
+    lock_file, owner, random_id, read_record, try_lock_file, validate_name, write_record,
 };
 use crate::envelope::Warning;
 use crate::error::{Error, Next, Reason};
@@ -272,7 +273,8 @@ impl Store {
         write_record(scratch.path(), RECORD, &record)?;
 
         let spec = self.spec(&parent.layers, &relative)?;
-        overlay::probe(&spec, &scratch.path().join(PROBE), backend.privilege)
+        let point = self.open_beneath(&relative.join(PROBE))?;
+        overlay::probe(&spec, &point, backend.privilege)
             .map_err(|failure| self.mount_failure(failure, backend.privilege))?;
         crash_point("worktree-create");
         let probe = scratch.path().join(PROBE);
@@ -363,6 +365,24 @@ impl Store {
                 format!("Can't mount a worktree at {shown}. It's inside the store."),
             ));
         }
+        let point =
+            at::open_dir_no_symlinks(&dir).map_err(|err| fs_error(err, format!("open {shown}")))?;
+        if let Some(uid) = owner::acting_uid() {
+            let owner_uid = at::fstat(&point)
+                .map_err(|err| fs_error(err, format!("read {shown}")))?
+                .uid;
+            if owner_uid != uid {
+                return Err(Error::new(
+                    Reason::PermissionDenied,
+                    format!(
+                        "Can't mount a worktree at {shown}. It belongs to {}, and beavy mounts a worktree of {}'s store only on a directory {} owns.",
+                        owner::name_of(owner_uid),
+                        owner::name_of(uid),
+                        owner::name_of(uid)
+                    ),
+                ));
+            }
+        }
         let (_guard, warnings) = self.open_for_change()?;
         let record = self.find_worktree(selector)?;
         let _entering = self.lock_worktree(&record.id)?;
@@ -391,7 +411,7 @@ impl Store {
         self.ensure_idle(&worktree)?;
         let snapshot = self.snapshot_of(&record)?;
         let spec = self.spec(&snapshot.layers, &Path::new(WORKTREES).join(&record.id))?;
-        overlay::mount_persistent(&spec, &dir)
+        overlay::mount_persistent(&spec, &point)
             .map_err(|failure| self.mount_failure(failure, privilege))?;
         Ok(Mounted {
             worktree: self.fresh_view(&record)?,
@@ -447,16 +467,39 @@ impl Store {
         let record = self.find_worktree(&record.id)?;
         let snapshot = self.snapshot_of(&record)?;
         let target = PathBuf::from(&snapshot.source);
-        if !target.is_dir() {
-            return Err(Error::new(
-                Reason::NotFound,
-                format!(
-                    "Can't run in worktree {}. Commands run in a worktree at the directory its snapshot was imported from, and {} doesn't exist.",
-                    record.id,
-                    target.display()
-                ),
-            ));
+        let point = File::open(&target)
+            .map(OwnedFd::from)
+            .ok()
+            .filter(|point| at::fstat(point).is_ok_and(|stat| stat.kind == FileType::Directory))
+            .ok_or_else(|| {
+                Error::new(
+                    Reason::NotFound,
+                    format!(
+                        "Can't run in worktree {}. Commands run in a worktree at the directory its snapshot was imported from, and {} doesn't exist.",
+                        record.id,
+                        target.display()
+                    ),
+                )
+            })?;
+        if let Some(uid) = owner::acting_uid() {
+            let owner_uid = at::fstat(&point)
+                .map_err(|err| fs_error(err, format!("read {}", target.display())))?
+                .uid;
+            if owner_uid != uid {
+                return Err(Error::new(
+                    Reason::PermissionDenied,
+                    format!(
+                        "Can't run in worktree {} at {}. It belongs to {}, and beavy mounts a worktree of {}'s store only on a directory {} owns.",
+                        record.id,
+                        target.display(),
+                        owner::name_of(owner_uid),
+                        owner::name_of(uid),
+                        owner::name_of(uid)
+                    ),
+                ));
+            }
         }
+        let point = Opened::new(&target, point)?;
         let cwd = fs::canonicalize(cwd)
             .ok()
             .filter(|cwd| cwd.starts_with(&target))
@@ -488,7 +531,7 @@ impl Store {
             entry,
             privilege,
             maps: IdMaps::identity(),
-            target: c_path(&target)?,
+            point,
             cwd: c_path(&cwd)?,
             keep: run.as_raw_fd(),
             user: owner::command_user().map(|user| {
@@ -616,7 +659,9 @@ impl Store {
             let mounted = self
                 .spec(&journal.snapshot.layers, &relative)
                 .and_then(|spec| {
-                    overlay::mount_persistent(&spec, Path::new(point))
+                    let dir = at::open_dir_no_symlinks(Path::new(point))
+                        .map_err(|err| fs_error(err, format!("open {point}")))?;
+                    overlay::mount_persistent(&spec, &dir)
                         .map_err(|failure| self.mount_failure(failure, Privilege::Root))
                 });
             if let Err(err) = mounted {
@@ -801,13 +846,31 @@ impl Store {
         self.absolute().join(WORKTREES).join(id)
     }
 
+    /// What mounting `layers` under the worktree directory `worktree`, relative to
+    /// the store, needs: every directory open, so the mount can't be redirected.
     fn spec(&self, layers: &[String], worktree: &Path) -> Result<Spec, Error> {
-        let store = self.absolute();
+        let mut dirs = Vec::new();
+        for layer in layers {
+            dirs.push(self.open_beneath(&Path::new(LAYERS).join(layer))?);
+        }
+        let upper = self.open_beneath(&worktree.join(UPPER))?;
+        let work = self.open_beneath(&worktree.join(WORK))?;
+        let options = overlay::options(&dirs, &upper, &work)?;
+        dirs.extend([upper, work]);
         Ok(Spec {
-            store: c_path(&store)?,
-            source: c_path(&store.join(worktree))?,
-            options: overlay::options(layers, &worktree.join(UPPER), &worktree.join(WORK))?,
+            source: c_path(&self.absolute().join(worktree))?,
+            options,
+            dirs,
         })
+    }
+
+    /// Open the directory `relative` in the store without following a symlink.
+    fn open_beneath(&self, relative: &Path) -> Result<Opened, Error> {
+        let path = self.absolute().join(relative);
+        at::open_dir(&self.absolute())
+            .and_then(|store| at::open_dir_beneath(&store, relative))
+            .map_err(|err| fs_error(err, format!("open {}", path.display())))
+            .and_then(|fd| Opened::new(&path, fd))
     }
 
     fn mount_failure(&self, failure: Failure, privilege: Privilege) -> Error {
@@ -853,6 +916,7 @@ impl Store {
             .create(true)
             .truncate(false)
             .mode(0o644)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&path)
             .map_err(|err| match err.kind() {
                 ErrorKind::NotFound => self.worktree_not_found(id),
@@ -874,7 +938,11 @@ impl Store {
         let mut pids = Vec::new();
         for entry in list_dir(&runs).unwrap_or_default() {
             let path = runs.join(&entry);
-            let Ok(file) = File::open(&path) else {
+            let Ok(mut file) = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&path)
+            else {
                 continue;
             };
             match try_lock_file(&file, libc::LOCK_EX) {
@@ -884,9 +952,9 @@ impl Store {
                     }
                 }
                 Ok(false) => {
-                    if let Some(pid) = fs::read_to_string(&path)
-                        .ok()
-                        .and_then(|text| text.trim().parse().ok())
+                    let mut text = String::new();
+                    if file.read_to_string(&mut text).is_ok()
+                        && let Ok(pid) = text.trim().parse()
                     {
                         pids.push(pid);
                     }

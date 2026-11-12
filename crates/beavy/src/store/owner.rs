@@ -35,6 +35,13 @@ pub(crate) fn privileged() -> bool {
     rustix::process::geteuid().is_root()
 }
 
+/// The user this thread acts as, when beavy is root acting as another user.
+pub(crate) fn acting_uid() -> Option<u32> {
+    // SAFETY: setfsuid with an invalid ID changes nothing and returns the current one.
+    let uid = unsafe { libc::setfsuid(u32::MAX) } as u32;
+    (privileged() && uid != 0).then_some(uid)
+}
+
 /// Whether file access on this thread is root's: beavy is root and isn't acting as
 /// another user.
 pub(crate) fn acting_as_root() -> bool {

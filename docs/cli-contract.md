@@ -493,15 +493,16 @@ Runs a command in the worktree. The command gets its own mount namespace with th
 worktree mounted over the worktree's `path`, so it sees the project at its usual
 path while nothing outside it sees the worktree. It starts in the current
 directory when that's inside `path`, and in `path` otherwise, with
-`BEAVY_WORKTREE` set.
+`BEAVY_WORKTREE` set. The mount has no setuid or device files (`nosuid,nodev`).
 
 beavy enters the namespace and then replaces itself with the command, so the
 command keeps beavy's process ID, stdin, stdout, stderr, and signals, runs as the
 caller's own user and group, and its exit status is beavy's. Through `sudo`, the
-caller is the user who ran sudo: the command runs as that user, with their groups;
-a root login runs commands as root. beavy writes nothing once the command starts,
-even with `--json`. Failures before it starts follow the contract: `not_found` for
-an unknown worktree or command, `backend_unavailable` when the mount fails,
+caller is the user who ran sudo: the command runs as that user, with their groups,
+and `path` must belong to them (`permission_denied` otherwise); a root login runs
+commands as root. beavy writes nothing once the command starts, even with
+`--json`. Failures before it starts follow the contract: `not_found` for an
+unknown worktree or command, `backend_unavailable` when the mount fails,
 `permission_denied` when the command can't run as the user who ran sudo.
 
 Commands in one worktree may run at the same time. The first mounts the worktree
@@ -517,7 +518,8 @@ beavy worktrees mount <WORKTREE> <DIR> [--store <DIR>] [--json]
 Mounts the worktree on `<DIR>` for every process. Needs root; without it, the
 command fails with `permission_denied` and suggests `beavy worktrees run`. A
 worktree has one mount at a time, and mounting fails with `worktree_in_use` while
-commands run in it. Result: `{ "worktree": <worktree>, "outcome": "mounted", "backend": <backend>, "store": { "path": "..." } }`,
+commands run in it. Through `sudo`, a `<DIR>` the user who ran sudo doesn't own
+fails with `permission_denied`. Result: `{ "worktree": <worktree>, "outcome": "mounted", "backend": <backend>, "store": { "path": "..." } }`,
 or `"outcome": "unchanged"` when it's already mounted there.
 
 ### beavy worktrees unmount
