@@ -197,7 +197,9 @@ opaque directories are kept wherever they hide something in the base. A file the
 owner may not link, such as one owned by another user under
 `fs.protected_hardlinks`, is copied instead. The store lock is released while
 layers merge, so the rest of the store carries on; the worktree's own lock keeps
-everything else off the worktree being sealed.
+everything else off the worktree being sealed. A seal that merged 8 layers of
+30,000 new files each took 207 s, and a worktree created 0.3 s into it was ready
+0.2 s later; while the merge held the store lock, the same create waited 198 s.
 
 Measured on the n8n tree from the [benchmark](#benchmark), with chains of sealed
 layers built without squashing. Each layer holds an edit plus an incremental
@@ -301,6 +303,15 @@ number is from a release build.
 
 The sealed snapshot showed the edit and the rebuilt output, and the real tree was
 unchanged.
+
+The table predates two later changes: commands look for processes left in their
+worktree, and a seal syncs the filesystem before it writes the snapshot record.
+Measured again on the same machine afterwards, with the build before them taking
+turns over 25 rounds (medians, warm, in a user namespace): creating a worktree
+took 12 ms against 10, starting a command 9 against 8, listing worktrees 7
+against 3, sealing 19 against 11, and deleting 10 against 6. The extra time is
+one pass over `/proc`, which reads each mount namespace's table once, and for a
+seal the sync.
 
 Inside against outside, cold means after dropping the page cache:
 
